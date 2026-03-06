@@ -1,0 +1,13 @@
+.env
+.git
+.pytest_cache
+__pycache__
+*.pyc
+outputs/
+logs/
+.venv
+venv
+node_modules
+frontend/node_modules
+.cache
+*.egg-info
