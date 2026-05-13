@@ -166,10 +166,11 @@ def chunk_by_sentences(text: str, max_words: int = 50) -> list[str]:
 def strip_markers(text: str) -> str:
     """
     Remove audio-designer markers from text for clean TTS input.
-    Strips: [PAUSE Xms], [PAUSE Xs], [CUE: ...], [EMPHASIS], [/EMPHASIS]
+    Strips: [PAUSE Xms], [PAUSE Xs], [CUE: ...], [VISUAL: ...], [EMPHASIS], [/EMPHASIS]
     """
     text = re.sub(r'\[PAUSE\s+[\d.]+m?s\]', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'\[CUE:[^\]]*\]', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[VISUAL:[^\]]*\]', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\[/?EMPHASIS\]', '', text, flags=re.IGNORECASE)
     # Remove citation markers: [SRC-N], [SRC-N, SRC-M], [SRC N], etc.
     text = re.sub(r'\[(?:SRC[-\s]?\d+[,\s]*)+\]', '', text, flags=re.IGNORECASE)
@@ -216,15 +217,20 @@ _META_LINE_RE = re.compile(
 )
 
 
-def strip_llm_noise(text: str) -> str:
+def strip_llm_noise(text: str, preserve_visual_markers: bool = False) -> str:
     """
     Remove all common LLM-generated noise from spoken script text:
     - Preamble lines  ("Okay, here's the annotated script...")
     - Stage directions on their own line  ("(Sound of frantic typing)")
     - Known inline stage directions        ("(Short pause, sipping tea)")
-    - [CUE: ...] markers
+    - [CUE: ...] markers (always)
+    - [VISUAL: ...] markers (unless `preserve_visual_markers=True`)
     - Markdown code fences
     - Meta commentary lines ("Word count: 250")
+
+    `preserve_visual_markers` is set by the visual-marker LLM pass, which is
+    the only caller that *wants* [VISUAL:] markers to survive cleanup. Every
+    other caller (prosody pass, fact-checker, writer, etc.) wants them gone.
     """
     # 1. Strip markdown fences
     text = _CODE_FENCE_RE.sub('', text)
@@ -238,8 +244,10 @@ def strip_llm_noise(text: str) -> str:
     # 4. Strip known inline stage directions
     text = _STAGE_DIRECTION_INLINE_RE.sub('', text)
 
-    # 5. Strip [CUE: ...] markers (belt-and-suspenders alongside strip_markers)
+    # 5. Strip [CUE: ...] always, [VISUAL: ...] unless preserved
     text = re.sub(r'\[CUE:[^\]]*\]', '', text, flags=re.IGNORECASE)
+    if not preserve_visual_markers:
+        text = re.sub(r'\[VISUAL:[^\]]*\]', '', text, flags=re.IGNORECASE)
 
     # 6. Strip meta lines
     text = _META_LINE_RE.sub('', text)

@@ -41,6 +41,7 @@ class PodcastState(TypedDict):
 
     # Post-production artifacts
     whisper_words: List[Dict[str, Any]]
+    visual_cues: List[Dict[str, Any]]   # [{prompt, start_ms, end_ms, word_index}, …]
 
     # Structured error records accumulated across nodes (any node can return more).
     errors: Annotated[List[Dict[str, Any]], operator.add]

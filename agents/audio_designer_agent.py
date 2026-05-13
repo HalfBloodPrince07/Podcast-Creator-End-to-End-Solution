@@ -5,6 +5,9 @@ Markers used:
   [PAUSE 500ms]   [PAUSE 1s]   [PAUSE 2s]
   [EMPHASIS]...[/EMPHASIS]
   [CUE: INTRO_MUSIC]  [CUE: CHAPTER_TRANSITION]  [CUE: OUTRO_MUSIC]  [CUE: SFX_WHOOSH]
+  [VISUAL: cinematic photo of ...] — one per ~80 spoken words, drives
+                                     per-cue clip/still generation in the
+                                     visual_agent. Stripped from TTS input.
 """
 from __future__ import annotations
 
@@ -69,8 +72,128 @@ def strip_cues(text: str) -> str:
     """Remove all audio markers for clean TTS input if needed."""
     text = re.sub(r'\[PAUSE\s+[\d.]+m?s\]', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'\[CUE:[^\]]*\]', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[VISUAL:[^\]]*\]', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\[/?EMPHASIS\]', '', text, flags=re.IGNORECASE)
     return re.sub(r'\s{2,}', ' ', text).strip()
+
+
+# ---------------------------------------------------------------------------
+# Visual cue insertion
+# ---------------------------------------------------------------------------
+
+VISUAL_SYSTEM_PROMPT = """You are the visual director for a podcast video. Insert [VISUAL: ...] markers \
+into a spoken script so a downstream AI image/video model knows what to show on screen.
+
+VISUAL MARKER RULES:
+- Format exactly: [VISUAL: cinematic, detailed prompt describing one concrete scene]
+- One [VISUAL:] marker every ~80 spoken words (count words, not characters).
+- Place the marker IMMEDIATELY BEFORE the sentence whose subject the visual depicts.
+- Each prompt MUST be a concrete, photographable scene — describe the subject, setting, \
+lighting, lens/style. Example: "cinematic wide shot of a quantum computer in a clean room, \
+cold blue light, shallow depth of field, photorealistic, 35mm film."
+- DO NOT describe text, charts, slides, logos, or abstract concepts. Always translate ideas \
+into a physical scene a camera could capture.
+- DO NOT repeat the spoken words verbatim; translate them into visuals.
+- Vary scenes — no two consecutive [VISUAL:] markers should describe the same setting.
+
+GENERAL RULES:
+- Do NOT modify the existing text in any way. Only INSERT [VISUAL: ...] markers.
+- Do NOT remove or alter existing [PAUSE], [EMPHASIS], [CUE:] markers.
+- Return ONLY the marked-up text, no explanations."""
+
+
+_VISUAL_RE_LOCAL = re.compile(r'\[VISUAL:[^\]]*\]', re.IGNORECASE)
+
+
+def _strip_existing_visuals(text: str) -> str:
+    """Remove any pre-existing [VISUAL:] markers so we don't double-insert."""
+    return re.sub(r'\s*\[VISUAL:[^\]]*\]\s*', ' ', text, flags=re.IGNORECASE)
+
+
+def _rule_based_visual_markers(text: str, words_per_visual: int = 80) -> str:
+    """Fallback visual marker insertion when no LLM is available.
+
+    Inserts a [VISUAL: <derived prompt>] marker every ~`words_per_visual`
+    spoken words. The prompt is derived from the first sentence of the
+    surrounding paragraph plus a cinematic style suffix — enough for the
+    image/video model to produce a usable visual without hand-authoring.
+    """
+    # Work paragraph-by-paragraph so markers land on paragraph boundaries.
+    paragraphs = re.split(r'\n{2,}', text)
+    out_paragraphs: list[str] = []
+    words_since_last = 0
+
+    style_suffix = ", cinematic, photorealistic, dramatic lighting, 35mm film"
+
+    for para in paragraphs:
+        if not para.strip():
+            out_paragraphs.append(para)
+            continue
+
+        # Strip any prosody/cue markers when deriving the visual prompt so
+        # the visual model isn't fed "[PAUSE 1s]" as part of the prompt.
+        clean = strip_cues(para)
+        first_sentence = re.split(r'(?<=[.!?])\s+', clean.strip())[0] if clean.strip() else ""
+        # Trim to ~14 words to keep prompts short and on-topic.
+        prompt_seed = " ".join(first_sentence.split()[:14]).rstrip(".!?,;:")
+
+        para_words = len(clean.split())
+        if prompt_seed and words_since_last + para_words >= words_per_visual:
+            marker = f"[VISUAL: {prompt_seed}{style_suffix}]"
+            out_paragraphs.append(f"{marker}\n{para}")
+            words_since_last = para_words
+        else:
+            out_paragraphs.append(para)
+            words_since_last += para_words
+
+    # If the script had no paragraph break long enough to trigger a marker
+    # (e.g. a short single-paragraph segment), force one at the top so every
+    # segment contributes at least one visual.
+    rendered = "\n\n".join(out_paragraphs)
+    if not _VISUAL_RE_LOCAL.search(rendered):
+        clean = strip_cues(text).strip()
+        first_sentence = re.split(r'(?<=[.!?])\s+', clean)[0] if clean else ""
+        prompt_seed = " ".join(first_sentence.split()[:14]).rstrip(".!?,;:")
+        if prompt_seed:
+            rendered = f"[VISUAL: {prompt_seed}{style_suffix}]\n{rendered}"
+    return rendered
+
+
+async def _llm_visual_markers(client, seg_name: str, text: str) -> str:
+    """LLM-driven [VISUAL:] insertion. Falls back to rule-based on any failure."""
+    from utils import strip_markers
+    word_count = count_words(text)
+    budget = max(2048, word_count * 8)
+    try:
+        raw = await async_retry_llm_call(
+            lambda: client.system_user(
+                VISUAL_SYSTEM_PROMPT + "\n\n/no_think",
+                f"Insert [VISUAL: ...] markers into this segment (one per ~80 spoken words). "
+                f"Return the FULL segment with markers inserted, leaving every other character "
+                f"unchanged:\n\n{text}",
+                temperature=AUDIO_DESIGNER_TEMPERATURE,
+                max_tokens=budget,
+            ),
+            logger_inst=logger,
+        )
+        # Keep [VISUAL:] markers through cleanup — strip_llm_noise's default
+        # behaviour removes them along with [CUE:], which is exactly what we
+        # *don't* want on this pass.
+        cleaned = strip_llm_noise(raw, preserve_visual_markers=True)
+        # Compare word counts on text with all markers stripped so [VISUAL: ...]
+        # tokens don't inflate cleaned and mask a real truncation.
+        cleaned_words = count_words(strip_markers(cleaned))
+        original_words = count_words(strip_markers(text))
+        if not cleaned.strip() or cleaned_words < int(original_words * 0.7):
+            logger.warning("LLM visual marker pass for '%s' truncated/empty — using rule-based", seg_name)
+            return _rule_based_visual_markers(text)
+        if not _VISUAL_RE_LOCAL.search(cleaned):
+            logger.info("LLM did not insert [VISUAL:] markers for '%s' — using rule-based", seg_name)
+            return _rule_based_visual_markers(cleaned)
+        return cleaned
+    except Exception as exc:
+        logger.warning("LLM visual marker error in '%s': %s — using rule-based", seg_name, exc)
+        return _rule_based_visual_markers(text)
 
 async def _llm_markers(client, seg_name: str, text: str) -> str:
     # Reasoning models can burn the whole budget inside <think>...</think> on a
@@ -140,6 +263,15 @@ async def run_audio_designer_node(state: dict) -> dict:
             )
             marked_text = _rule_based_markers(raw_text) or raw_text
 
+        # 3. Add visual markers for downstream video generation. Runs AFTER
+        # prosody so [VISUAL:] markers land between sentences, never inside
+        # an [EMPHASIS]…[/EMPHASIS] span.
+        marked_text = _strip_existing_visuals(marked_text)
+        if dry_run or not client:
+            marked_text = _rule_based_visual_markers(marked_text)
+        else:
+            marked_text = await _llm_visual_markers(client, seg_name, marked_text)
+
         new_seg = dict(seg)
         new_seg["text"] = prefix + marked_text
         out_segments.append(new_seg)
@@ -200,6 +332,12 @@ class AudioDesignerAgent:
                         marked_text = asyncio.run(_llm_markers(self.client, seg_name, text))
                 except Exception:
                     marked_text = _rule_based_markers(text)
+
+            # Visual marker pass — rule-based in the sync wrapper to avoid
+            # tangling another event-loop dance. The async node above uses
+            # the LLM path; this wrapper exists mainly for unit tests.
+            marked_text = _strip_existing_visuals(marked_text)
+            marked_text = _rule_based_visual_markers(marked_text)
 
             new_seg = ScriptSegment(
                 name=seg.name,

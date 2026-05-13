@@ -713,9 +713,21 @@ async def generate_video(req: VideoRequest):
 
         def _run():
             from agents.video_agent import generate_podcast_video
+            # Pull the segments persisted by the assembler so the visual_agent
+            # can derive gap-filler prompts from real script context.
+            script_segments: list[dict] = []
+            try:
+                meta_file = out_dir / "metadata.json"
+                if meta_file.exists():
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    script_segments = meta.get("segments") or []
+            except Exception:
+                script_segments = []
             try:
                 video_path = generate_podcast_video(
-                    audio_path, srt_path, out_dir, req.title, progress=progress_cb
+                    audio_path, srt_path, out_dir, req.title,
+                    progress=progress_cb,
+                    script_segments=script_segments,
                 )
                 q.put({"done": True, "video_path": video_path})
             except Exception as exc:

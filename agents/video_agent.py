@@ -319,15 +319,29 @@ def _video_enc_args(gpu: bool) -> list[str]:
     ]
 
 
-def _render_video(bg_png: Path, audio: Path, out: Path) -> bool:
+def _render_video(bg_png: Path, audio: Path, out: Path, visual_bed: Optional[Path] = None) -> bool:
     """
     Composite background + animated waveform visualiser using FFmpeg.
     Produces a video without burned subtitles.
     Uses GPU (h264_nvenc) when available, falls back to CPU (libx264).
+
+    If `visual_bed` (an MP4 spanning the full audio duration) is provided, it
+    replaces the static PNG as the background layer — the rest of the
+    compositing (waveform overlay, scale-to-1080p, encoding) is identical.
     """
     # Waveform: mode=line draws vertical bars (clean, no area fill).
     # colorkey removes the black background -> RGBA stream.
     # overlay composites the transparent waveform onto the dark background.
+    use_bed = visual_bed is not None and Path(visual_bed).exists()
+    if use_bed:
+        # Visual bed already matches W×H @ FPS; just take its video stream.
+        # We still emit "[0:v]" so the rest of the filter graph is unchanged.
+        bg_input = ["-i", str(visual_bed)]
+        bg_pre = "[0:v]"
+    else:
+        bg_input = ["-loop", "1", "-framerate", str(FPS), "-i", str(bg_png)]
+        bg_pre = "[0:v]"
+
     filt = (
         f"[1:a]showwaves=s={W}x{VIS_H}:mode=line"
         f":colors={WAVE_CLR1}:rate={FPS}:scale=sqrt[wraw];"
@@ -335,13 +349,13 @@ def _render_video(bg_png: Path, audio: Path, out: Path) -> bool:
         "[w2]gblur=sigma=3[wblur];"
         "[w1][wblur]blend=all_mode=screen[wglow];"
         "[wglow]colorkey=color=black:similarity=0.08:blend=0.0[walpha];"
-        f"[0:v][walpha]overlay=0:{VIS_Y}:format=auto[vout]"
+        f"{bg_pre}[walpha]overlay=0:{VIS_Y}:format=auto[vout]"
     )
 
     gpu = _gpu_encode()
     cmd = [
         "ffmpeg", "-y",
-        "-loop", "1", "-framerate", str(FPS), "-i", str(bg_png),
+        *bg_input,
         "-i", str(audio),
         "-filter_complex", filt,
         "-map", "[vout]", "-map", "1:a",
@@ -359,7 +373,7 @@ def _render_video(bg_png: Path, audio: Path, out: Path) -> bool:
         logger.warning("GPU encode failed — retrying with CPU (libx264)")
         cmd_cpu = [
             "ffmpeg", "-y",
-            "-loop", "1", "-framerate", str(FPS), "-i", str(bg_png),
+            *bg_input,
             "-i", str(audio),
             "-filter_complex", filt,
             "-map", "[vout]", "-map", "1:a",
@@ -440,13 +454,17 @@ def generate_podcast_video(
     output_dir: Path,
     episode_title: str,
     progress: Optional[Callable[[str, int], None]] = None,
+    use_visual_bed: bool = True,
+    script_segments: Optional[list[dict]] = None,
 ) -> Optional[str]:
     """
     Generate a 1080p podcast video. Returns the output MP4 path or None on failure.
 
     Steps:
-      1. Build styled background PNG (Pillow)
-      2. FFmpeg: background + audio ->MP4 with animated waveform
+      1. (Optional) Build an AI-generated visual bed from [VISUAL:] cues +
+         Whisper timings if visual_cues.json is present alongside the audio.
+         Falls back to the styled background PNG otherwise.
+      2. FFmpeg: bed (or background) + audio -> MP4 with animated waveform
       3. FFmpeg: burn subtitles from SRT
     """
     if not _ffmpeg_ok():
@@ -460,23 +478,40 @@ def generate_podcast_video(
     raw_path  = output_dir / "_video_raw.mp4"
     final_path = output_dir / "episode.mp4"
 
-    # ── Step 1: background ────────────────────────────────────────────────────
-    if progress:
-        progress("Rendering background...", 10)
-    try:
-        _build_background(episode_title, bg_path)
-    except Exception as exc:
-        logger.warning("Pillow background failed (%s) - using solid colour fallback", exc)
+    # ── Step 1: visual bed (preferred) or styled background fallback ──────────
+    visual_bed_path: Optional[Path] = None
+    if use_visual_bed and (output_dir / "visual_cues.json").exists():
+        if progress:
+            progress("Building AI visual bed...", 5)
         try:
-            _build_background_fallback(bg_path)
-        except Exception:
-            logger.error("Fallback background also failed - aborting")
-            return None
+            from agents.visual_agent import build_visual_bed
+            visual_bed_path = build_visual_bed(
+                audio_path=Path(audio_path),
+                output_dir=output_dir,
+                script_segments=script_segments,
+                progress=progress,
+            )
+        except Exception as exc:
+            logger.warning("Visual bed build crashed (%s) — falling back to static background.", exc)
+            visual_bed_path = None
+
+    if visual_bed_path is None:
+        if progress:
+            progress("Rendering background...", 10)
+        try:
+            _build_background(episode_title, bg_path)
+        except Exception as exc:
+            logger.warning("Pillow background failed (%s) - using solid colour fallback", exc)
+            try:
+                _build_background_fallback(bg_path)
+            except Exception:
+                logger.error("Fallback background also failed - aborting")
+                return None
 
     # ── Step 2: video + waveform ──────────────────────────────────────────────
     if progress:
         progress("Compositing video with waveform...", 20)
-    if not _render_video(bg_path, Path(audio_path), raw_path):
+    if not _render_video(bg_path, Path(audio_path), raw_path, visual_bed=visual_bed_path):
         _cleanup(bg_path)
         return None
 
@@ -496,6 +531,10 @@ def generate_podcast_video(
         _move(raw_path, final_path)
 
     _cleanup(bg_path)
+    if visual_bed_path is not None:
+        # The stitched bed is large (~50 MB+); per-interval PNG cache lives
+        # under _visual_images/ for Phase 4 re-rolls.
+        _cleanup(visual_bed_path)
 
     if progress:
         progress("Video ready!", 100)

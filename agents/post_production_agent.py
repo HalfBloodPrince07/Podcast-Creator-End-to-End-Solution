@@ -32,7 +32,7 @@ from constants import (
     MUSIC_DUCK_MODE,
     PODCAST_EQ_FILTER,
 )
-from utils import get_logger, make_error_record
+from utils import get_logger, make_error_record, strip_markers
 
 logger = get_logger("PostProductionAgent")
 
@@ -47,6 +47,7 @@ CUE_ASSET_MAP = {
 }
 
 _CUE_RE = re.compile(r'\[CUE:\s*(\w+)\]', re.IGNORECASE)
+_VISUAL_RE = re.compile(r'\[VISUAL:\s*([^\]]+)\]', re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +167,63 @@ def _cue_positions_from_whisper(
 
         actual = int(seg.get("actual_words") or 0)
         if not actual:
-            text_no_cues = _CUE_RE.sub("", raw)
-            actual = len(text_no_cues.split())
+            actual = len(strip_markers(raw).split())
         cumulative_words += actual
+
+    return cues
+
+
+def _visual_cue_positions_from_whisper(
+    segments: list[dict],
+    words: list[dict],
+) -> list[dict]:
+    """Extract [VISUAL: prompt] cues and their audio timings.
+
+    Walks each segment in order, computing the cumulative count of spoken
+    words (markers stripped) before each [VISUAL:] occurrence, then looks up
+    the corresponding word in the Whisper word list to obtain start_ms.
+    end_ms is filled in as a second pass — each cue runs until the next
+    cue starts (or until the end of the spoken audio for the final cue).
+
+    Returns: list of {prompt, start_ms, end_ms, word_index} dicts.
+    Empty list if no Whisper words available.
+    """
+    if not words:
+        return []
+
+    cues: list[dict] = []
+    cumulative_words = 0
+
+    for seg in segments:
+        raw = seg.get("text", "") or ""
+        last_end = 0
+        for m in _VISUAL_RE.finditer(raw):
+            prefix = raw[last_end:m.start()]
+            prefix_clean = strip_markers(prefix)
+            prefix_words = len(prefix_clean.split()) if prefix_clean else 0
+            cumulative_words += prefix_words
+            idx = min(cumulative_words, len(words) - 1)
+            start_ms = int(words[idx]["start"] * 1000)
+            cues.append({
+                "prompt": m.group(1).strip(),
+                "start_ms": start_ms,
+                "end_ms": 0,  # filled below
+                "word_index": idx,
+            })
+            last_end = m.end()
+
+        # Account for spoken words after the last marker in this segment
+        tail_clean = strip_markers(raw[last_end:])
+        cumulative_words += len(tail_clean.split()) if tail_clean else 0
+
+    # Fill end_ms as the start of the next cue (or end of audio for the last).
+    audio_end_ms = int(words[-1]["end"] * 1000)
+    for i, cue in enumerate(cues):
+        cue["end_ms"] = cues[i + 1]["start_ms"] if i + 1 < len(cues) else audio_end_ms
+        # Guarantee positive duration (Whisper word ordering can rarely produce
+        # adjacent markers at the same timestamp on very fast speech).
+        if cue["end_ms"] <= cue["start_ms"]:
+            cue["end_ms"] = cue["start_ms"] + 1500
 
     return cues
 
@@ -187,8 +242,7 @@ def _cue_positions_estimated(segments: list[dict]) -> list[tuple[str, int]]:
             cues.append((cue_name, position_ms))
         actual = int(seg.get("actual_words") or 0)
         if not actual:
-            text_no_cues = _CUE_RE.sub("", raw)
-            actual = len(text_no_cues.split())
+            actual = len(strip_markers(raw).split())
         cumulative_words += actual
     return cues
 
@@ -534,12 +588,35 @@ def _run_post_production_sync(state: dict) -> dict:
     else:
         new_audio = str(audio_in)
 
+    # Visual cue extraction — happens after Whisper alignment because we
+    # need real word timings to position each [VISUAL:] cue on the audio.
+    visual_cues = _visual_cue_positions_from_whisper(segments, words) if words else []
+    if visual_cues:
+        logger.info("Extracted %d [VISUAL:] cue(s) from script.", len(visual_cues))
+    else:
+        logger.info("No [VISUAL:] cues found (or Whisper words unavailable).")
+
+    # Persist artifacts the downstream video step reads. The video endpoint
+    # in app.py is invoked separately from LangGraph, so we put the data on
+    # disk rather than expecting it to live in the in-memory state.
+    try:
+        (output_dir / "visual_cues.json").write_text(
+            json.dumps(visual_cues, indent=2), encoding="utf-8"
+        )
+        if words:
+            (output_dir / "whisper_words.json").write_text(
+                json.dumps(words), encoding="utf-8"
+            )
+    except Exception as exc:
+        logger.warning("Could not persist visual/whisper artifacts: %s", exc)
+
     updated_tts = {**tts_result, "audio_path": new_audio, "mastered": mastered_ok, "music_mixed": music_applied}
 
     return {
         "current_status": "Post-production complete",
         "tts_results": updated_tts,
         "whisper_words": words,
+        "visual_cues": visual_cues,
         "errors": errors,
     }
 

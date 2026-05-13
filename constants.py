@@ -246,3 +246,37 @@ MUSIC_DUCK_MODE = "sidechain"  # "sidechain" | "static"
 # normalization measurement reflects what the listener will hear.
 # Chain: highpass(80Hz) → presence boost (+2dB @ 3kHz)
 PODCAST_EQ_FILTER = "highpass=f=80,equalizer=f=3000:width_type=q:w=1:g=2"
+
+# ---------------------------------------------------------------------------
+# Visual generation (AI image/video bed driven by [VISUAL: ...] cues)
+# ---------------------------------------------------------------------------
+# SDXL is used for stills (gap fillers in Phase 2, and as keyframes / cue
+# fallbacks in Phase 3). 16:9 aspect ratio matches the 1920x1080 video frame.
+SDXL_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+SDXL_WIDTH = 1152      # supported SDXL aspect bucket close to 16:9 (1.8:1)
+SDXL_HEIGHT = 640
+SDXL_STEPS = 28
+SDXL_GUIDANCE = 7.0
+SDXL_NEGATIVE_PROMPT = (
+    "text, watermark, signature, logo, low quality, blurry, deformed, "
+    "extra limbs, bad anatomy, jpeg artifacts, oversaturated"
+)
+# Tail style suffix appended to every visual prompt so output stays cohesive.
+VISUAL_STYLE_SUFFIX = (
+    ", cinematic, photorealistic, dramatic lighting, 35mm film, "
+    "shallow depth of field, 8k detail"
+)
+
+# Ken-Burns motion for each still inside the video bed.
+VISUAL_KEN_BURNS_ZOOM = 1.15    # final zoom factor at end of each still's interval
+VISUAL_KEN_BURNS_FPS = 30
+VISUAL_BED_WIDTH = 1920
+VISUAL_BED_HEIGHT = 1080
+VISUAL_CROSSFADE_MS = 600       # crossfade duration between adjacent intervals
+
+# t2v model (Phase 3). When the runtime can't load it, the bed falls back to
+# SDXL stills at cue intervals.
+COGVIDEOX_MODEL_ID = "THUDM/CogVideoX-5b"
+COGVIDEOX_NUM_FRAMES = 49       # ~6 seconds at 8 fps native CogVideoX output
+COGVIDEOX_NUM_INFERENCE_STEPS = 50
+COGVIDEOX_GUIDANCE = 6.0
