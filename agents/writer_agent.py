@@ -110,9 +110,6 @@ STYLE RULES (every rule is mandatory):
 - Direct address: use "you" and "we" constantly. Never write for a third-party reader.
 - Contractions always: "it's", "you'll", "we're", "that's", "here's", "don't", "isn't".
 - Show don't tell: use one vivid concrete analogy or mini-story for every abstract concept.
-- Transitions: use spoken signposts between ideas — "But here's the thing.", "Now picture this.",
-  "So what does that actually mean?", "And it gets better.", "Here's where it gets interesting.",
-  "Think about it this way."
 - Rhetorical questions: 1–2 per section to pull the listener in.
 - Rule of threes: group related points in threes for rhythm and memorability.
 - No passive voice. No academic language. No jargon without an immediate plain-English follow-up.
@@ -120,6 +117,22 @@ STYLE RULES (every rule is mandatory):
   Example: "That's 3 billion dollars — enough to pay 50,000 engineers for a full year."
 - NEVER fabricate statistics. Only reference provided sources.
 - Word count: hit within ±10% of the target.
+
+ANTI-REPETITION RULES (this is what separates good scripts from amateur ones):
+- ONE-AND-DONE ANALOGIES: every analogy, metaphor, or mini-story is single-use across the entire
+  episode. If a prior segment used a chef-and-recipes analogy, you must reach for a completely
+  different domain (architect, gardener, courtroom, traffic, music — pick one not yet used).
+- VARY TRANSITIONS: pick a different opener for every segment. Acceptable signposts include
+  "But here's the thing.", "Now picture this.", "So what does that actually mean?",
+  "And it gets better.", "Here's where it gets interesting.", "Think about it this way.",
+  "Strip away the hype and…", "Here's what most people miss.", "Zoom in on this for a second."
+  Use each signpost AT MOST ONCE per episode. Better: invent a fresh one.
+- NO RECYCLED FACTS: do not restate a statistic, citation, or framing you have already used.
+  Each segment advances the story with NEW information drawn from the sources.
+
+EMPHASIS RULES (hard cap — violations are immediately visible to listeners):
+- Maximum TWO [EMPHASIS]…[/EMPHASIS] tags per paragraph. Three or more sounds like a hard sell.
+- Never emphasise articles, pronouns, filler words, or whole clauses. Only 1–3 high-weight words.
 
 OUTPUT RULES (violations break the pipeline):
 - Output ONLY the spoken script text. Nothing else.
@@ -214,10 +227,32 @@ def _dry_run_text(seg_name: str, target_words: int) -> str:
     }.get(seg_name, f"Now let's dive into {seg_name}. ")
     return prefix + " ".join(words)
 
+def _format_prior_segments(prior: list[dict], max_chars: int = 3000) -> str:
+    """Compact view of segments already written, so the next call can avoid repeating them.
+
+    Trims oldest content first if the combined text exceeds max_chars — recent context
+    matters most for avoiding back-to-back duplicates.
+    """
+    if not prior:
+        return ""
+    blocks: list[str] = []
+    for seg in prior:
+        name = seg.get("name", "?")
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        blocks.append(f"--- {name} ---\n{text}")
+    joined = "\n\n".join(blocks)
+    if len(joined) > max_chars:
+        joined = "…(earlier segments truncated)…\n\n" + joined[-max_chars:]
+    return joined
+
+
 async def _write_segment(
     client, seg_name: str, target_words: int, topic: str, tone: str,
     audience: str, sources_block: str, constraints_block: str, dry_run: bool,
     narrative_arc: str = "",
+    prior_segments: Optional[list[dict]] = None,
 ) -> str:
     if dry_run or not client:
         return _dry_run_text(seg_name, target_words)
@@ -268,6 +303,16 @@ async def _write_segment(
         if narrative_arc else ""
     )
 
+    prior_block = ""
+    prior_view = _format_prior_segments(prior_segments or [])
+    if prior_view:
+        prior_block = (
+            "\nALREADY WRITTEN in earlier segments — do NOT repeat any analogy, opener, "
+            "statistic, citation focus, or framing from below. Read this, then take the "
+            "story FORWARD with material that is genuinely new:\n"
+            f"\"\"\"\n{prior_view}\n\"\"\"\n"
+        )
+
     user_prompt = f"""Write the **{seg_name}** section of a podcast episode.
 
 Topic: {topic}
@@ -275,7 +320,7 @@ Tone: {tone}{tone_line}
 Target audience: {audience}
 Target word count: {target_words} words (±10% is acceptable)
 {constraints_block}
-{arc_block}
+{arc_block}{prior_block}
 Segment instructions:
 {seg_instruction}
 
@@ -436,6 +481,7 @@ async def run_writer_node(state: dict) -> dict:
             client, seg_name, t_words, topic, tone, audience,
             sources_block, constraints_block, dry_run,
             narrative_arc=narrative_arc,
+            prior_segments=script_segments,
         )
 
         speaker = "host"
