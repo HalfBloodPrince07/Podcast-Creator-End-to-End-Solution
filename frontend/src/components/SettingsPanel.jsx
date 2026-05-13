@@ -1,30 +1,62 @@
-export default function SettingsPanel({ llmUrl, setLlmUrl, llmKey, setLlmKey, llmModel, setLlmModel, availableModels, refreshModels }) {
+import { RefreshCw } from 'lucide-react';
+import Card from './ui/Card';
+import { Input, Select } from './ui/Input';
+import Button from './ui/Button';
+
+/**
+ * SettingsPanel — legacy inline settings card.
+ * Kept for backward compatibility — main app uses <SettingsDrawer/> in the TopBar.
+ */
+export default function SettingsPanel({
+  llmUrl, setLlmUrl, llmKey, setLlmKey, llmModel, setLlmModel,
+  availableModels = [], refreshModels,
+}) {
   return (
-    <div className="glass-panel">
-      <h3 style={{ marginTop: 0, fontSize: '1.1rem' }}>Quick Settings</h3>
-      <div className="form-group">
-        <label>LLM Base URL</label>
-        <input type="text" value={llmUrl} onChange={(e) => setLlmUrl(e.target.value)} />
+    <Card padding="md">
+      <div
+        style={{
+          fontSize: 'var(--text-md)',
+          fontWeight: 600,
+          marginBottom: 'var(--space-4)',
+          letterSpacing: 'var(--tracking-tight)',
+        }}
+      >
+        Quick settings
       </div>
-      <div className="grid-2">
-        <div className="form-group">
-          <label>API Key</label>
-          <input type="password" value={llmKey} onChange={(e) => setLlmKey(e.target.value)} />
-        </div>
-        <div className="form-group">
-          <label>Model</label>
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
-            <select style={{ flex: 1 }} value={llmModel} onChange={(e) => setLlmModel(e.target.value)}>
-              {availableModels.map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
-            <button type="button" className="btn btn-secondary" style={{ padding: '0 0.5rem' }} onClick={refreshModels} title="Refresh Models">
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+        <Input
+          label="LLM base URL"
+          value={llmUrl}
+          onChange={(e) => setLlmUrl(e.target.value)}
+        />
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--space-3)' }}>
+          <Input
+            label="API key"
+            type="password"
+            value={llmKey}
+            onChange={(e) => setLlmKey(e.target.value)}
+            optional
+          />
+          <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'flex-end' }}>
+            <div style={{ flex: 1 }}>
+              <Select label="Model" value={llmModel} onChange={(e) => setLlmModel(e.target.value)}>
+                {availableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </Select>
+            </div>
+            <Button
+              size="md"
+              variant="secondary"
+              iconLeft={<RefreshCw size={13} />}
+              onClick={refreshModels}
+            >
               Refresh
-            </button>
+            </Button>
           </div>
         </div>
       </div>
-    </div>
+    </Card>
   );
 }
