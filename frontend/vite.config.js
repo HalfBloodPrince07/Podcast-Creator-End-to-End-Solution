@@ -13,6 +13,10 @@ export default defineConfig({
       '/outputs': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
+      },
+      '/voice_samples': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
       }
     }
   }

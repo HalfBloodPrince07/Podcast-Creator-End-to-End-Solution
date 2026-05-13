@@ -1,45 +1,39 @@
-import React from 'react';
+import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import useSettings from './hooks/useSettings';
 import useGeneration from './hooks/useGeneration';
 import EpisodeConfigForm from './components/EpisodeConfigForm';
-import SettingsPanel from './components/SettingsPanel';
 import ProgressPanel from './components/ProgressPanel';
 import ResultsPanel from './components/ResultsPanel';
 import EpisodeLibrary from './components/EpisodeLibrary';
+import VoiceProfiles from './components/VoiceProfiles';
 import BackgroundScene from './components/BackgroundScene';
+import ScriptEditor from './components/ScriptEditor';
+import TopBar from './components/TopBar';
+import SettingsDrawer from './components/SettingsDrawer';
 import './index.css';
 
-// Animation variants for panel entrances
-const panelVariants = {
-  hidden: { opacity: 0, y: 30, scale: 0.95 },
-  visible: {
-    opacity: 1,
-    y: 0,
-    scale: 1,
-    transition: { type: 'spring', stiffness: 300, damping: 30, mass: 0.8 }
-  },
-  exit: {
-    opacity: 0,
-    y: -20,
-    scale: 0.95,
-    transition: { duration: 0.2 }
-  }
+const tabVariants = {
+  hidden:  { opacity: 0, y: 12 },
+  visible: { opacity: 1, y: 0, transition: { duration: 0.26, ease: [0.16, 1, 0.3, 1] } },
+  exit:    { opacity: 0, y: -8, transition: { duration: 0.16 } },
 };
 
-const staggerContainer = {
-  hidden: { opacity: 0 },
-  visible: {
-    opacity: 1,
-    transition: {
-      staggerChildren: 0.15
-    }
-  }
+const panelStagger = {
+  hidden:  { opacity: 0 },
+  visible: { opacity: 1, transition: { staggerChildren: 0.08 } },
+};
+
+const panelEnter = {
+  hidden:  { opacity: 0, y: 14, scale: 0.985 },
+  visible: { opacity: 1, y: 0,  scale: 1, transition: { type: 'spring', stiffness: 280, damping: 32 } },
 };
 
 function App() {
   const settings = useSettings();
   const gen = useGeneration();
+  const [activeTab, setActiveTab] = useState('generate');
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const handleGenerate = (formData) => {
     gen.generate({
@@ -50,93 +44,125 @@ function App() {
     });
   };
 
+  // Only render the 3D scene on the Generate tab to avoid useless GPU work elsewhere.
+  const sceneActive = activeTab === 'generate';
+
   return (
     <>
-      <BackgroundScene isGenerating={gen.isGenerating} />
+      <BackgroundScene isGenerating={gen.isGenerating} active={sceneActive} />
 
       <div id="root">
-        <motion.div
-          className="app-header"
-          initial={{ opacity: 0, y: -50 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, ease: "easeOut" }}
-        >
-          <h1>Podcast Production Pipeline</h1>
-          <p>Multi-agent AI system &middot; Research &rarr; Script &rarr; Fact-check &rarr; Audio</p>
-        </motion.div>
+        <TopBar
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          isGenerating={gen.isGenerating}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
 
-        <motion.div
-          className="grid-layout"
-          variants={staggerContainer}
-          initial="hidden"
-          animate="visible"
-        >
-          {/* Left Column */}
-          <motion.div className="left-panel" variants={panelVariants}>
-            <EpisodeConfigForm
-              isGenerating={gen.isGenerating}
-              onGenerate={handleGenerate}
-              onStop={gen.stop}
-            />
-
-            <div style={{ marginTop: '2rem' }}>
-              <SettingsPanel {...settings} />
-            </div>
-          </motion.div>
-
-          {/* Right Column */}
-          <motion.div
-            className="right-panel"
-            style={{ display: 'flex', flexDirection: 'column', gap: '2.5rem' }}
-            variants={panelVariants}
-          >
-            <AnimatePresence mode="popLayout">
+        <main className="app-shell">
+          <AnimatePresence mode="wait">
+            {activeTab === 'generate' && (
               <motion.div
-                key="progress-panel"
-                layout
-                initial={{ opacity: 0, x: 50 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ type: 'spring', stiffness: 200, damping: 25 }}
+                key="generate"
+                variants={tabVariants}
+                initial="hidden"
+                animate="visible"
+                exit="exit"
               >
-                <ProgressPanel
-                  isGenerating={gen.isGenerating}
-                  currentStage={gen.currentStage}
-                  progress={gen.progress}
-                  logs={gen.logs}
-                  lastError={gen.lastError}
-                  onRetry={gen.retry}
-                />
-              </motion.div>
-
-              {(gen.results || gen.script || gen.sources.length > 0) && (
                 <motion.div
-                  key="results-panel"
-                  layout
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: 'auto' }}
-                  exit={{ opacity: 0, height: 0 }}
-                  transition={{ type: 'spring', stiffness: 200, damping: 25 }}
+                  className="bento-grid"
+                  variants={panelStagger}
+                  initial="hidden"
+                  animate="visible"
                 >
-                  <ResultsPanel
-                    results={gen.results}
-                    script={gen.script}
-                    sources={gen.sources}
-                  />
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-        </motion.div>
+                  {/* Left column — Configuration */}
+                  <motion.div variants={panelEnter} style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-6)' }}>
+                    <EpisodeConfigForm
+                      isGenerating={gen.isGenerating}
+                      onGenerate={handleGenerate}
+                      onStop={gen.stop}
+                    />
+                  </motion.div>
 
-        <motion.div
-          style={{ marginTop: '3.5rem' }}
-          initial={{ opacity: 0, y: 40 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true, margin: "-100px" }}
-          transition={{ duration: 0.6, delay: 0.2 }}
-        >
-          <EpisodeLibrary />
-        </motion.div>
+                  {/* Right column — Progress + Script editor + Results */}
+                  <motion.div
+                    variants={panelEnter}
+                    style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-6)' }}
+                  >
+                    <AnimatePresence mode="popLayout">
+                      <motion.div key="progress-panel" layout>
+                        <ProgressPanel
+                          isGenerating={gen.isGenerating}
+                          currentStage={gen.currentStage}
+                          progress={gen.progress}
+                          logs={gen.logs}
+                          lastError={gen.lastError}
+                          onRetry={gen.retry}
+                        />
+                      </motion.div>
+
+                      {gen.pausedForReview && (
+                        <motion.div
+                          key="script-editor"
+                          layout
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: 'auto' }}
+                          exit={{ opacity: 0, height: 0 }}
+                          transition={{ type: 'spring', stiffness: 220, damping: 28 }}
+                        >
+                          <ScriptEditor
+                            pausedState={gen.pausedForReview}
+                            onResume={gen.resume}
+                            onCancel={gen.stop}
+                          />
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </motion.div>
+                </motion.div>
+
+                {/* Results — full-width row beneath bento */}
+                <AnimatePresence>
+                  {(gen.results || gen.script?.length > 0 || gen.sources?.length > 0) && (
+                    <motion.div
+                      key="results-row"
+                      layout
+                      initial={{ opacity: 0, y: 16 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8 }}
+                      transition={{ type: 'spring', stiffness: 220, damping: 30 }}
+                      style={{ marginTop: 'var(--space-6)' }}
+                    >
+                      <ResultsPanel
+                        results={gen.results}
+                        script={gen.script}
+                        sources={gen.sources}
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.div>
+            )}
+
+            {activeTab === 'voices' && (
+              <motion.div key="voices" variants={tabVariants} initial="hidden" animate="visible" exit="exit">
+                <VoiceProfiles />
+              </motion.div>
+            )}
+
+            {activeTab === 'library' && (
+              <motion.div key="library" variants={tabVariants} initial="hidden" animate="visible" exit="exit">
+                <EpisodeLibrary />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </main>
+
+        <SettingsDrawer
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          {...settings}
+        />
       </div>
     </>
   );
