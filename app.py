@@ -1,9 +1,29 @@
 import os
+import sys
+import io
 import json
 import asyncio
 from pathlib import Path
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+# Fix Windows cp1252 console encoding so emoji log messages (e.g. from
+# chatterbox-tts) don't trigger UnicodeEncodeError.
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    # Also patch any logging handlers that were created before this point
+    import logging as _logging
+    for _h in _logging.root.handlers:
+        if hasattr(_h, "stream") and hasattr(_h.stream, "reconfigure"):
+            try:
+                _h.stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import FileResponse as FastAPIFileResponse
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -20,7 +40,47 @@ from config import PipelineConfig
 from llm_client import get_client, reset_client
 from graph import app_graph, PodcastState
 
-app = FastAPI(title="Podcast Pipeline API")
+from contextlib import asynccontextmanager
+import logging as _app_logging
+
+_startup_logger = _app_logging.getLogger("Startup")
+
+
+def _preload_whisper() -> None:
+    """Preload the faster-whisper model so the first episode doesn't pay the cold-start tax."""
+    try:
+        from constants import WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
+        from faster_whisper import WhisperModel
+        device = WHISPER_DEVICE
+        compute = WHISPER_COMPUTE_TYPE
+        if device == "auto":
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                device = "cpu"
+        if device == "cuda" and compute == "int8":
+            compute = "float16"
+        _startup_logger.info("Preloading Whisper %s on %s (%s)...", WHISPER_MODEL, device, compute)
+        # Touch the model so the download happens at startup
+        WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+        _startup_logger.info("Whisper preloaded.")
+    except ImportError:
+        _startup_logger.info("faster-whisper not installed — Whisper preload skipped.")
+    except Exception as exc:
+        _startup_logger.warning("Whisper preload failed (%s) — first episode will load on demand.", exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI lifespan: preload heavy models on startup."""
+    # Run preload in a thread so it doesn't block the event loop
+    await asyncio.to_thread(_preload_whisper)
+    yield
+    # nothing to cleanup
+
+
+app = FastAPI(title="Podcast Pipeline API", lifespan=lifespan)
 
 # Allow CORS for the Vite dev server; override via CORS_ORIGINS env var
 CORS_ORIGINS = os.getenv(
@@ -41,6 +101,11 @@ OUTPUTS_DIR = Path("./outputs")
 OUTPUTS_DIR.mkdir(exist_ok=True)
 app.mount("/outputs", StaticFiles(directory=OUTPUTS_DIR), name="outputs")
 
+# Serve voice_samples directory for reference audio playback
+VOICE_SAMPLES_DIR = Path("./voice_samples")
+VOICE_SAMPLES_DIR.mkdir(exist_ok=True)
+app.mount("/voice_samples", StaticFiles(directory=VOICE_SAMPLES_DIR), name="voice_samples")
+
 ENV_PATH = Path(__file__).parent / ".env"
 
 # ---------------------------------------------------------------------------
@@ -59,16 +124,72 @@ class GenerateRequest(BaseModel):
     multi_voice: bool = False
     tts_backend: str = "kokoro"
     voice_gender: str = "female"
+    voice_id: str = ""        # UUID of a saved voice clone (optional)
     output_dir: str = "./outputs"
     llm_url: str = ""
     llm_key: str = ""
     llm_model: str = ""
+    pause_for_review: bool = False  # pause after audio_design so user can edit script
+
+
+class ResumeRequest(BaseModel):
+    run_id: str
+    segments: Optional[list[dict]] = None  # optional user-edited segments
 
 class SettingsRequest(BaseModel):
     llm_url: str = ""
     llm_key: str = ""
     llm_model: str = ""
     tts_model: str = ""
+
+class VideoRequest(BaseModel):
+    audio_url: str
+    srt_url: str = ""
+    title: str = "Podcast Episode"
+
+
+class EstimateRequest(BaseModel):
+    minutes: int = 5
+    tts_backend: str = "kokoro"
+    dry_run: bool = False
+    multi_voice: bool = False
+
+
+class RegenerateSegmentRequest(BaseModel):
+    run_id: str
+    segment_name: str
+    edited_text: Optional[str] = None  # if provided, skip writer and use this exact text
+
+
+# Rough wall-clock estimates per node, in seconds. Tuned for a modest desktop CPU
+# + GPU; users can recalibrate by editing these constants.
+_NODE_BASE_COST_S = {
+    "topic_refine": 3.0,
+    "search":       8.0,
+    "write":        4.0,        # plus per-minute below
+    "fact_check":   3.0,
+    "audio_design": 2.0,
+    "tts":          5.0,
+    "post_production": 8.0,
+    "assemble":     3.0,
+}
+# Per-minute-of-target-audio multipliers, in seconds per minute.
+_NODE_PER_MIN_COST_S = {
+    "write":        4.5,
+    "fact_check":   3.0,
+    "audio_design": 2.0,
+    "assemble":     0.4,
+}
+# TTS realtime factors: seconds of synthesis per second of audio output.
+_TTS_RT_FACTOR = {
+    "kokoro":     0.30,
+    "chatterbox": 0.55,
+    "bark":       1.70,
+    "qwen":       1.20,
+}
+# Post-production (whisper + ffmpeg loudnorm) realtime factor: seconds of work
+# per second of input audio.
+_POST_PROD_RT_FACTOR = 0.20
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -77,6 +198,62 @@ class SettingsRequest(BaseModel):
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/api/estimate")
+async def estimate_run(req: EstimateRequest):
+    """
+    Estimate generation time before the user kicks off a full run.
+    Returns total seconds and a per-node breakdown so the frontend can
+    show 'Est. X minutes' next to the Generate button.
+    """
+    minutes = max(1, int(req.minutes))
+    backend = (req.tts_backend or "kokoro").lower()
+
+    if req.dry_run:
+        # Dry run skips LLM + TTS heavy work; mostly file I/O
+        breakdown = {n: 0.5 for n in _NODE_BASE_COST_S}
+        breakdown["assemble"] = 2.0
+        total = sum(breakdown.values())
+        return {
+            "total_seconds": int(total),
+            "total_human":   _seconds_human(total),
+            "breakdown":     breakdown,
+            "dry_run":       True,
+        }
+
+    audio_seconds = minutes * 60
+    rt = _TTS_RT_FACTOR.get(backend, 0.6)
+
+    breakdown: dict[str, float] = {}
+    for node, base in _NODE_BASE_COST_S.items():
+        per_min = _NODE_PER_MIN_COST_S.get(node, 0.0)
+        cost = base + per_min * minutes
+        if node == "tts":
+            cost = base + audio_seconds * rt
+        elif node == "post_production":
+            cost = base + audio_seconds * _POST_PROD_RT_FACTOR
+        breakdown[node] = round(cost, 1)
+
+    total = sum(breakdown.values())
+    return {
+        "total_seconds": int(total),
+        "total_human":   _seconds_human(total),
+        "breakdown":     breakdown,
+        "tts_backend":   backend,
+        "minutes":       minutes,
+    }
+
+
+def _seconds_human(secs: float) -> str:
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m}m {s}s" if s else f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
 
 @app.get("/api/ready")
 async def ready():
@@ -152,6 +329,12 @@ async def list_episodes():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             run_id = meta.get("run_id", meta_path.parent.name)
+            ep_dir = meta_path.parent
+            rel = ep_dir.relative_to(OUTPUTS_DIR).as_posix()
+            # Probe for files served via /outputs/...
+            audio_url     = f"/outputs/{rel}/episode.mp3" if (ep_dir / "episode.mp3").exists() else None
+            thumbnail_url = f"/outputs/{rel}/thumbnail.png" if (ep_dir / "thumbnail.png").exists() else None
+            video_url     = f"/outputs/{rel}/episode.mp4" if (ep_dir / "episode.mp4").exists() else None
             episodes.append({
                 "run_id": run_id,
                 "title": meta.get("episode_title", "Untitled"),
@@ -163,12 +346,290 @@ async def list_episodes():
                 "dry_run": meta.get("dry_run", False),
                 "source_count": meta.get("source_count", 0),
                 "actual_words": meta.get("actual_words", 0),
-                "has_audio": bool(meta.get("audio_filename")),
+                "has_audio": bool(audio_url),
+                "audio_url": audio_url,
+                "thumbnail_url": thumbnail_url,
+                "video_url": video_url,
             })
         except Exception:
             continue
     episodes.sort(key=lambda e: e.get("generated_at", ""), reverse=True)
     return {"episodes": episodes}
+
+
+@app.post("/api/regenerate-segment")
+async def regenerate_segment(req: RegenerateSegmentRequest):
+    """
+    Regenerate a single segment of an existing episode.
+    Steps: writer (or use edited_text) -> audio_design -> invalidate TTS cache for that segment
+           -> TTS (synthesizes only the missing chunk) -> post_production -> assemble.
+    Streams progress via SSE.
+    """
+    # Locate the episode
+    ep_dir = None
+    metadata = None
+    for meta_path in OUTPUTS_DIR.rglob("metadata.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if meta.get("run_id") == req.run_id or meta_path.parent.name == req.run_id:
+            ep_dir = meta_path.parent
+            metadata = meta
+            break
+
+    if not ep_dir or not metadata:
+        raise HTTPException(status_code=404, detail=f"Episode '{req.run_id}' not found")
+
+    segments = list(metadata.get("segments") or [])
+    if not segments:
+        raise HTTPException(status_code=400, detail="Episode metadata has no segments — regenerate not possible")
+
+    target_idx = next((i for i, s in enumerate(segments) if s.get("name") == req.segment_name), -1)
+    if target_idx < 0:
+        raise HTTPException(status_code=404, detail=f"Segment '{req.segment_name}' not found in episode")
+
+    # Invalidate the TTS WAV for this segment so the cache miss forces re-synth
+    import re as _re
+    safe_name = _re.sub(r"[^\w\-]", "_", req.segment_name).strip("_")
+    seg_wav = ep_dir / "tts_segments" / f"{target_idx:02d}_{safe_name}.wav"
+    if seg_wav.exists():
+        try:
+            seg_wav.unlink()
+        except Exception:
+            pass
+
+    async def event_stream():
+        yield json.dumps({"stage": "Starting", "pct": 2, "msg": f"Regenerating '{req.segment_name}'..."})
+
+        # Build a minimal state from metadata + a writer call
+        from agents.writer_agent import _write_segment, _format_sources
+        from agents.audio_designer_agent import _llm_markers, _rule_based_markers
+        from agents.tts_agent import run_tts_node
+        from agents.post_production_agent import run_post_production_node
+        from agents.assembler_agent import run_assembler_node
+        from constants import CUE_MAP, TRANSITION_CUE
+        from llm_client import get_client
+
+        client = get_client() if not metadata.get("dry_run") else None
+        sources = metadata.get("sources", [])
+        sources_block = _format_sources(sources)
+
+        seg = segments[target_idx]
+        topic = metadata.get("podcast_topic", "")
+        tone = metadata.get("tone", "conversational")
+        audience = metadata.get("audience", "general listeners")
+
+        # Step 1: writer (or edited override)
+        yield json.dumps({"stage": "Writing", "pct": 12, "msg": "Generating new copy for the segment..."})
+        if req.edited_text and req.edited_text.strip():
+            new_text = req.edited_text.strip()
+        else:
+            new_text = await _write_segment(
+                client, req.segment_name, int(seg.get("target_words", 200)),
+                topic, tone, audience, sources_block, "",
+                bool(metadata.get("dry_run")),
+                narrative_arc=metadata.get("narrative_arc", ""),
+            )
+
+        # Step 2: audio design (prosody markers + cue)
+        yield json.dumps({"stage": "Audio design", "pct": 30, "msg": "Adding prosody markers..."})
+        cue = CUE_MAP.get(req.segment_name, TRANSITION_CUE if target_idx > 0 else "")
+        prefix = f"{cue}\n" if cue else ""
+        marked = _rule_based_markers(new_text) if (metadata.get("dry_run") or not client) else \
+                 await _llm_markers(client, req.segment_name, new_text)
+        seg["text"] = prefix + marked
+        from utils import count_words as _cw
+        seg["actual_words"] = _cw(seg["text"])
+        segments[target_idx] = seg
+
+        # Step 3: rebuild state for TTS/post-production/assemble
+        state = {
+            "topic": topic,
+            "refined_topic": topic,
+            "tone": tone,
+            "audience": audience,
+            "target_minutes": metadata.get("target_minutes", 5),
+            "target_words": metadata.get("target_words", 1000),
+            "dry_run": bool(metadata.get("dry_run")),
+            "multi_voice": False,
+            "tts_backend": metadata.get("tts_backend") or "kokoro",
+            "voice_gender": metadata.get("voice_gender") or "female",
+            "voice_id": metadata.get("voice_id"),
+            "output_dir": str(ep_dir),
+            "episode_title": metadata.get("episode_title", "Episode"),
+            "script_segments": segments,
+            "sources": sources,
+            "current_status": "Regenerate",
+            "errors": [],
+            "narrative_arc": metadata.get("narrative_arc", ""),
+        }
+
+        # Step 4: TTS — cached WAVs for OTHER segments stay; only target re-synthesizes
+        yield json.dumps({"stage": "TTS", "pct": 45, "msg": "Synthesising replacement audio..."})
+        tts_update = await run_tts_node(state)
+        state.update(tts_update)
+
+        # Step 5: post-production
+        yield json.dumps({"stage": "Post-production", "pct": 75, "msg": "Re-mixing and remastering..."})
+        pp_update = await run_post_production_node(state)
+        state.update(pp_update)
+
+        # Step 6: re-assemble
+        yield json.dumps({"stage": "Assembly", "pct": 92, "msg": "Updating transcripts and metadata..."})
+        asm_update = await run_assembler_node(state)
+        state.update(asm_update)
+
+        asm = state.get("final_assembly", {}) or {}
+        def _rel(p):
+            if not p: return None
+            try:
+                base = OUTPUTS_DIR.resolve()
+                ap = Path(p).resolve()
+                return f"/outputs/{ap.relative_to(base).as_posix()}"
+            except Exception:
+                return None
+
+        yield json.dumps({
+            "stage": "Complete",
+            "pct": 100,
+            "msg": f"'{req.segment_name}' regenerated successfully",
+            "done": True,
+            "audio_url": _rel(asm.get("audio_path")),
+            "srt_url":   _rel(asm.get("srt_path")),
+            "notes_url": _rel(asm.get("notes_path")),
+            "run_id": req.run_id,
+        })
+
+    return EventSourceResponse(event_stream())
+
+
+@app.post("/api/resume-generation")
+async def resume_generation(req: ResumeRequest):
+    """
+    Resume a paused generation. Reads the stashed `_pending.json` for the run,
+    optionally swaps in user-edited segments, then streams the remaining
+    TTS → post-production → assembly stages via SSE.
+    """
+    # Locate pending state
+    pending_path = None
+    for p in OUTPUTS_DIR.rglob("_pending.json"):
+        if p.parent.name == req.run_id:
+            pending_path = p
+            break
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if data.get("run_id") == req.run_id or data.get("episode_title"):
+                # Fallback: match by output_dir containing run_id
+                if req.run_id in str(p.parent):
+                    pending_path = p
+                    break
+        except Exception:
+            continue
+
+    if not pending_path:
+        raise HTTPException(status_code=404, detail=f"No paused state found for run '{req.run_id}'")
+
+    try:
+        state = json.loads(pending_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not load paused state: {exc}")
+
+    # Optional override: user-edited segments from the script editor
+    if req.segments:
+        # Preserve any unspecified fields from the original segments
+        original = {s.get("name"): s for s in state.get("script_segments", [])}
+        merged = []
+        for edited in req.segments:
+            base = dict(original.get(edited.get("name"), {}))
+            base.update(edited)
+            merged.append(base)
+        if merged:
+            state["script_segments"] = merged
+
+    async def event_stream():
+        from agents.tts_agent import run_tts_node
+        from agents.post_production_agent import run_post_production_node
+        from agents.assembler_agent import run_assembler_node
+
+        yield json.dumps({"stage": "Resuming", "pct": 72, "msg": "Starting TTS with reviewed script..."})
+
+        # TTS
+        try:
+            update = await run_tts_node(state)
+            state.update(update)
+        except Exception as exc:
+            yield json.dumps({"error": f"TTS failed: {exc}", "done": True})
+            return
+        yield json.dumps({"stage": "Post-production", "pct": 86, "msg": state.get("current_status", "TTS complete")})
+
+        # Post-production
+        try:
+            update = await run_post_production_node(state)
+            state.update(update)
+        except Exception as exc:
+            yield json.dumps({"error": f"Post-production failed: {exc}", "done": True})
+            return
+        yield json.dumps({"stage": "Assembly", "pct": 95, "msg": state.get("current_status", "Post-production complete")})
+
+        # Assemble
+        try:
+            update = await run_assembler_node(state)
+            state.update(update)
+        except Exception as exc:
+            yield json.dumps({"error": f"Assembly failed: {exc}", "done": True})
+            return
+
+        asm = state.get("final_assembly", {}) or {}
+        def _rel(p):
+            if not p: return None
+            try:
+                base = OUTPUTS_DIR.resolve()
+                ap = Path(p).resolve()
+                return f"/outputs/{ap.relative_to(base).as_posix()}"
+            except Exception:
+                return None
+
+        # Cleanup the pending stash
+        try:
+            pending_path.unlink()
+        except Exception:
+            pass
+
+        yield json.dumps({
+            "stage": "Complete",
+            "pct": 100,
+            "msg": "Episode generation complete",
+            "done": True,
+            "audio_url": _rel(asm.get("audio_path")),
+            "srt_url":   _rel(asm.get("srt_path")),
+            "notes_url": _rel(asm.get("notes_path")),
+            "run_id": req.run_id,
+        })
+
+    return EventSourceResponse(event_stream())
+
+
+@app.delete("/api/episodes/{run_id}")
+async def delete_episode(run_id: str):
+    """Delete an episode directory by run_id. Returns the number of files removed."""
+    import shutil
+    for meta_path in OUTPUTS_DIR.rglob("metadata.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        ep_dir = meta_path.parent
+        if meta.get("run_id") == run_id or ep_dir.name == run_id:
+            # Safety: ensure the directory is actually inside OUTPUTS_DIR
+            try:
+                ep_dir.resolve().relative_to(OUTPUTS_DIR.resolve())
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Refusing to delete: path escapes outputs/")
+            removed = sum(1 for _ in ep_dir.rglob("*"))
+            shutil.rmtree(ep_dir, ignore_errors=True)
+            return {"deleted": True, "run_id": run_id, "files_removed": removed}
+    raise HTTPException(status_code=404, detail=f"Episode '{run_id}' not found")
 
 
 @app.get("/api/episodes/{run_id}")
@@ -184,6 +645,7 @@ async def get_episode(run_id: str):
                 files = {}
                 for fname, key in [
                     ("episode.mp3", "audio_url"),
+                    ("episode.mp4", "video_url"),
                     ("transcript.srt", "srt_url"),
                     ("transcript.txt", "txt_url"),
                     ("show_notes.md", "notes_url"),
@@ -213,6 +675,80 @@ async def rss_feed(req: Request):
     base_url = str(req.base_url).rstrip("/")
     xml = generate_feed(OUTPUTS_DIR, base_url=base_url)
     return Response(content=xml, media_type="application/xml")
+
+
+# ── Video generation ──────────────────────────────────────────────────────────
+
+@app.post("/api/generate-video")
+async def generate_video(req: VideoRequest):
+    """
+    Stream video generation progress via SSE.
+    Accepts URLs served by /outputs/* and converts them to server paths.
+    """
+    def url_to_path(url: str) -> Optional[str]:
+        if not url:
+            return None
+        # e.g. /outputs/episode_xxxx/episode.mp3  →  ./outputs/episode_xxxx/episode.mp3
+        if url.startswith("/outputs/"):
+            rel = url[len("/outputs/"):]
+            return str(OUTPUTS_DIR / rel)
+        return None
+
+    audio_path = url_to_path(req.audio_url)
+    srt_path   = url_to_path(req.srt_url) or ""
+
+    if not audio_path or not Path(audio_path).exists():
+        raise HTTPException(status_code=400, detail="Audio file not found")
+
+    # Derive output directory from the audio file location
+    out_dir = Path(audio_path).parent
+
+    async def event_stream():
+        import queue, threading
+
+        q: queue.Queue = queue.Queue()
+
+        def progress_cb(msg: str, pct: int) -> None:
+            q.put({"msg": msg, "pct": pct})
+
+        def _run():
+            from agents.video_agent import generate_podcast_video
+            try:
+                video_path = generate_podcast_video(
+                    audio_path, srt_path, out_dir, req.title, progress=progress_cb
+                )
+                q.put({"done": True, "video_path": video_path})
+            except Exception as exc:
+                q.put({"done": True, "error": str(exc)})
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        while True:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+                continue
+
+            if item.get("done"):
+                vp = item.get("video_path")
+                if vp:
+                    # Convert absolute path back to a /outputs/… URL
+                    try:
+                        rel = Path(vp).resolve().relative_to(OUTPUTS_DIR.resolve())
+                        video_url = f"/outputs/{rel.as_posix()}"
+                    except ValueError:
+                        video_url = None
+                    yield json.dumps({"done": True, "pct": 100, "video_url": video_url})
+                else:
+                    yield json.dumps({"done": True, "error": item.get("error", "Video generation failed")})
+                break
+            else:
+                yield json.dumps({"done": False, "pct": item.get("pct", 0), "msg": item.get("msg", "")})
+            await asyncio.sleep(0)
+
+    return EventSourceResponse(event_stream())
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +816,7 @@ async def generate_podcast(req: Request):
             multi_voice=cfg.multi_voice,
             tts_backend=gen_req.tts_backend,
             voice_gender=gen_req.voice_gender,
+            voice_id=gen_req.voice_id.strip() or None,
             current_status="Initializing...",
             search_queries=[],
             sources=[],
@@ -290,16 +827,34 @@ async def generate_podcast(req: Request):
             errors=[]
         )
 
+        # Use run_id as the checkpoint thread_id so a crashed run can be resumed.
+        graph_config = {"configurable": {"thread_id": cfg.run_id}}
         try:
-            # We use .astream to get state updates after each node completes
-            async for step_result in app_graph.astream(state, stream_mode="updates"):
+            async for step_result in app_graph.astream(
+                state, stream_mode="updates", config=graph_config,
+            ):
                 # step_result is a dict with key = node_name, value = state_update
                 for node_name, state_update in step_result.items():
-                    # Check if error occurred
-                    if state_update.get("errors"):
-                        err_msg = state_update["errors"][-1]
-                        yield json.dumps({"error": err_msg, "done": True})
+                    # Structured error handling: only "error" severity is fatal,
+                    # warnings/info get surfaced as non-blocking notices.
+                    new_errors = state_update.get("errors") or []
+                    fatal = next((e for e in new_errors
+                                  if isinstance(e, dict) and e.get("severity") == "error"), None)
+                    if fatal:
+                        yield json.dumps({
+                            "error": fatal.get("message", "Unknown error"),
+                            "node": fatal.get("node", node_name),
+                            "done": True,
+                        })
                         return
+                    # Non-fatal notices: pass through as separate SSE events
+                    for warn in new_errors:
+                        if isinstance(warn, dict):
+                            yield json.dumps({
+                                "notice": warn.get("message", ""),
+                                "severity": warn.get("severity", "info"),
+                                "node": warn.get("node", node_name),
+                            })
 
                     # Construct progress object for frontend
                     pct_map = {
@@ -325,9 +880,35 @@ async def generate_podcast(req: Request):
                         "script": state_update.get("script_segments", []),
                         "done": False,
                     })
-                    
+
                     # Update our running state
                     state.update(state_update)
+
+                    # Optional pause point — after audio_design, before TTS.
+                    # User can review/edit the script in the frontend and POST
+                    # to /api/resume-generation to continue.
+                    if gen_req.pause_for_review and node_name == "audio_design":
+                        pending_path = Path(cfg.output_dir) / "_pending.json"
+                        pending_path.parent.mkdir(parents=True, exist_ok=True)
+                        # Only stash JSON-serialisable fields
+                        snap = {}
+                        for k, v in state.items():
+                            try:
+                                json.dumps(v, default=str)
+                                snap[k] = v
+                            except Exception:
+                                pass
+                        pending_path.write_text(json.dumps(snap, default=str), encoding="utf-8")
+                        yield json.dumps({
+                            "stage": "Awaiting review",
+                            "pct": 70,
+                            "msg": "Script is ready — edit and click Resume to continue generation",
+                            "paused": True,
+                            "run_id": cfg.run_id,
+                            "script_segments": state.get("script_segments", []),
+                            "narrative_arc": state.get("narrative_arc", ""),
+                        })
+                        return  # client must call /api/resume-generation
 
         except Exception as e:
             yield json.dumps({"error": str(e), "done": True})
@@ -379,6 +960,190 @@ async def generate_podcast(req: Request):
         yield json.dumps(final_state)
 
     return EventSourceResponse(event_generator())
+
+# ---------------------------------------------------------------------------
+# Voice Clone Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/voice-clone/chatterbox")
+async def create_chatterbox_clone(
+    name: str = Form(...),
+    files: list[UploadFile] = File(...),
+):
+    """
+    Upload one or more audio clips (WAV/MP3) to create a Chatterbox voice clone.
+    The clips are concatenated into a single reference file (capped at 20 s).
+    Returns the voice_id to pass in future /api/generate requests.
+    """
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    if not files:
+        raise HTTPException(status_code=400, detail="at least one audio file is required")
+
+    audio_clips: list[bytes] = []
+    for upload in files:
+        content_type = upload.content_type or ""
+        if not any(t in content_type for t in ("audio", "octet-stream")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{upload.filename}' does not appear to be an audio file",
+            )
+        audio_clips.append(await upload.read())
+
+    try:
+        from voice_manager import get_voice_manager
+        clone = get_voice_manager().create_chatterbox_voice_clone(
+            name=name.strip(),
+            audio_clips=audio_clips,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Voice clone failed: {e}")
+
+    return {
+        "voice_id": clone.voice_id,
+        "name": clone.name,
+        "duration_ms": clone.sample_duration_ms,
+        "clips_merged": len(audio_clips),
+    }
+
+
+@app.get("/api/voice-clones")
+async def list_voice_clones():
+    """List all saved voice clones."""
+    try:
+        from voice_manager import get_voice_manager
+        clones = get_voice_manager().list_voices()
+        return {"voice_clones": [c.to_dict() for c in clones]}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to list voice clones: {e}")
+
+
+@app.delete("/api/voice-clone/{voice_id}")
+async def delete_voice_clone(voice_id: str):
+    """Delete a voice clone and its reference audio file."""
+    from voice_manager import get_voice_manager
+    deleted = get_voice_manager().delete_voice_clone(voice_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Voice clone '{voice_id}' not found")
+    return {"deleted": voice_id}
+
+
+@app.get("/api/voice-clone/{voice_id}/reference")
+async def get_voice_reference_audio(voice_id: str):
+    """Serve the original reference audio WAV file for a voice clone."""
+    from voice_manager import get_voice_manager
+    clone = get_voice_manager().get_voice_clone(voice_id)
+    if not clone:
+        raise HTTPException(status_code=404, detail=f"Voice clone '{voice_id}' not found")
+    audio_path = Path(clone.ref_audio_path)
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Reference audio file not found")
+    return FastAPIFileResponse(
+        path=str(audio_path),
+        media_type="audio/wav",
+        filename=f"{clone.name}_reference.wav",
+    )
+
+
+@app.post("/api/voice-clone/{voice_id}/add-clips")
+async def add_clips_to_voice_clone(
+    voice_id: str,
+    files: list[UploadFile] = File(...),
+):
+    """
+    Append additional audio clips to an existing voice clone.
+    The clips are merged onto the end of the existing reference file.
+    If the total exceeds the cap, audio is trimmed from the start (keeping newest).
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="at least one audio file is required")
+
+    audio_clips: list[bytes] = []
+    for upload in files:
+        content_type = upload.content_type or ""
+        if not any(t in content_type for t in ("audio", "octet-stream")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{upload.filename}' does not appear to be an audio file",
+            )
+        audio_clips.append(await upload.read())
+
+    try:
+        from voice_manager import get_voice_manager
+        clone = get_voice_manager().append_clips_to_voice_clone(
+            voice_id=voice_id,
+            audio_clips=audio_clips,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Add clips failed: {e}")
+
+    return {
+        "voice_id": clone.voice_id,
+        "name": clone.name,
+        "duration_ms": clone.sample_duration_ms,
+        "clips_added": len(audio_clips),
+        "clone_type": clone.clone_type,
+    }
+
+
+class PreviewRequest(BaseModel):
+    text: str = ""
+
+
+@app.post("/api/voice-clone/{voice_id}/preview")
+async def preview_voice_clone(voice_id: str, req: PreviewRequest):
+    """
+    Generate a short TTS preview using Chatterbox with the given voice clone.
+    Returns the generated audio as a WAV file.
+    """
+    from voice_manager import get_voice_manager
+    clone = get_voice_manager().get_voice_clone(voice_id)
+    if not clone:
+        raise HTTPException(status_code=404, detail=f"Voice clone '{voice_id}' not found")
+
+    text = req.text.strip()
+    if not text:
+        text = "Hello, this is a preview of my voice clone. How does it sound?"
+
+    audio_path = Path(clone.ref_audio_path)
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Reference audio file not found")
+
+    def _generate_preview():
+        from agents.tts_agent import _ChatterboxBackend
+        if not _ChatterboxBackend.load():
+            raise RuntimeError(
+                "Chatterbox TTS is not available. Install: pip install chatterbox-tts"
+            )
+        audio_arr, sr = _ChatterboxBackend.synthesise(
+            text=text,
+            audio_prompt_path=str(audio_path),
+        )
+        import soundfile as sf
+        buf = io.BytesIO()
+        sf.write(buf, audio_arr, sr, format="WAV")
+        buf.seek(0)
+        return buf.getvalue()
+
+    try:
+        wav_bytes = await asyncio.to_thread(_generate_preview)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Preview generation failed: {e}")
+
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'inline; filename="{clone.name}_preview.wav"'},
+    )
+
 
 if __name__ == "__main__":
     import uvicorn
