@@ -2,6 +2,7 @@
 config.py — PipelineConfig dataclass for the Podcast Pipeline.
 Holds all user inputs and derived values used by every agent.
 """
+
 from __future__ import annotations
 
 import re
@@ -41,13 +42,23 @@ class PipelineConfig:
     target_minutes: int
     tone: str = "conversational"
     audience: str = "general listeners"
-    timeline_or_focus: Optional[str] = None      # e.g. "0:Intro,3:AI Origins,8:Outro" or None
-    constraints: Optional[str] = None            # e.g. "avoid jargon; must mention FDA"
+    timeline_or_focus: Optional[str] = (
+        None  # e.g. "0:Intro,3:AI Origins,8:Outro" or None
+    )
+    constraints: Optional[str] = None  # e.g. "avoid jargon; must mention FDA"
     target_wpm: int = DEFAULT_WPM
     output_base_dir: str = "./outputs"
     dry_run: bool = False
     skip_cache: bool = False
     multi_voice: bool = False
+
+    # --- voice cloning settings ---
+    voice_id: Optional[str] = None  # UUID of user's cloned voice
+    voice_gender: str = "female"  # fallback for non-clone backends
+    voice_stability: float = 0.75  # Consistency for long-form (0-1)
+    voice_similarity_boost: float = 0.85  # Similarity to reference (0-1)
+    tts_backend: Optional[str] = None  # Select Qwen backend variant
+    tts_qwen_backend: str = "qwen_base"
 
     # --- derived (auto-computed in __post_init__) ---
     target_words: int = field(init=False)
@@ -59,6 +70,16 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         # Clamp wpm to allowed range
         self.target_wpm = max(MIN_WPM, min(MAX_WPM, self.target_wpm))
+
+        # Clamp voice stability params
+        self.voice_stability = max(0.0, min(1.0, self.voice_stability))
+        self.voice_similarity_boost = max(0.0, min(1.0, self.voice_similarity_boost))
+
+        # Validate tts_qwen_backend
+        from constants import TTS_QWEN_BACKENDS
+
+        if self.tts_qwen_backend not in TTS_QWEN_BACKENDS:
+            self.tts_qwen_backend = "qwen_base"
 
         # Derived word-count target
         self.target_words = self.target_minutes * self.target_wpm
@@ -92,7 +113,7 @@ class PipelineConfig:
 
         fixed: dict[str, float] = {
             "Intro": SEGMENT_RATIOS["intro"],
-            "Hook":  SEGMENT_RATIOS["hook"],
+            "Hook": SEGMENT_RATIOS["hook"],
         }
         if include_mid_cta:
             fixed["Mid-Episode CTA"] = 0.05
@@ -103,9 +124,13 @@ class PipelineConfig:
 
         # --- parse timeline_or_focus ---
         chapter_names = self._parse_timeline()
-        n_chapters = max(1, len(chapter_names)) if chapter_names else max(1, self.target_minutes // 2)
+        n_chapters = (
+            max(1, len(chapter_names))
+            if chapter_names
+            else max(1, self.target_minutes // 2)
+        )
         if not chapter_names:
-            chapter_names = [f"Chapter {i+1}" for i in range(n_chapters)]
+            chapter_names = [f"Chapter {i + 1}" for i in range(n_chapters)]
 
         per_chapter_ratio = chapter_ratio / n_chapters
 
@@ -114,12 +139,14 @@ class PipelineConfig:
         def _add(name: str, ratio: float) -> None:
             secs = total_seconds * ratio
             words = int(self.target_words * ratio)
-            segments.append({
-                "name": name,
-                "ratio": ratio,
-                "target_seconds": round(secs),
-                "target_words": words,
-            })
+            segments.append(
+                {
+                    "name": name,
+                    "ratio": ratio,
+                    "target_seconds": round(secs),
+                    "target_words": words,
+                }
+            )
 
         _add("Intro", fixed["Intro"])
         _add("Hook", fixed["Hook"])
@@ -147,7 +174,10 @@ class PipelineConfig:
         Or plain comma-separated chapter names.
         Returns [] if None or "open".
         """
-        if not self.timeline_or_focus or self.timeline_or_focus.strip().lower() == "open":
+        if (
+            not self.timeline_or_focus
+            or self.timeline_or_focus.strip().lower() == "open"
+        ):
             return []
         names = []
         for part in self.timeline_or_focus.split(","):
