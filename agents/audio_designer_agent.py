@@ -14,18 +14,30 @@ from typing import Generator
 from config import PipelineConfig
 from constants import AUDIO_DESIGNER_TEMPERATURE, CUE_MAP, TRANSITION_CUE
 from llm_client import get_client
-from utils import get_logger, count_words, async_retry_llm_call
+from utils import get_logger, count_words, async_retry_llm_call, strip_llm_noise
 
 logger = get_logger("AudioDesignerAgent")
 
-PROSODY_SYSTEM_PROMPT = """You are an audio director for a podcast. Add subtle prosody markers to the spoken script.
-Rules:
-- Add [PAUSE 500ms] after commas in complex sentences for natural breathing.
-- Add [PAUSE 1s] at the end of each paragraph or major idea.
-- Add [PAUSE 2s] at very significant moments or before a key revelation.
-- Wrap crucial words or short phrases in [EMPHASIS]...[/EMPHASIS] (max 1–2 per paragraph).
+PROSODY_SYSTEM_PROMPT = """You are the audio director for a hit podcast. Add prosody markers that make the host \
+sound like a real person telling an exciting story — not a robot reading text.
+
+PAUSE RULES:
+- [PAUSE 500ms] — after a comma in a list or complex clause; after a rhetorical question.
+- [PAUSE 1s]    — BEFORE a surprising fact or key revelation (build anticipation before it lands);
+                  at the end of a major idea before moving to the next point.
+- [PAUSE 2s]    — only for the single most dramatic moment in the whole segment. Use at most once.
+
+EMPHASIS RULES:
+- [EMPHASIS]...[/EMPHASIS] — wrap the 1–3 words with the most emotional or informational weight.
+  Prefer: numbers and statistics, contrasting words ("but", "except", "only", "never"),
+  and the core topic keyword in each paragraph.
+- Maximum 2 EMPHASIS tags per paragraph.
+- Never emphasise articles (a, the), pronouns, or filler words.
+
+GENERAL RULES:
 - Do NOT change any words. Do NOT remove any text. Only INSERT the markers.
 - Do NOT add markers inside quoted text.
+- Vary pause lengths — a script where every pause is [PAUSE 1s] sounds robotic.
 - Return ONLY the marked-up text, no explanations."""
 
 
@@ -61,16 +73,26 @@ def strip_cues(text: str) -> str:
     return re.sub(r'\s{2,}', ' ', text).strip()
 
 async def _llm_markers(client, seg_name: str, text: str) -> str:
+    # Reasoning models can burn the whole budget inside <think>...</think> on a
+    # prompt this short, leaving nothing after stripping. Give a generous floor
+    # AND a /no_think hint so non-thinking output is preferred when supported.
+    word_count = count_words(text)
+    budget = max(2048, word_count * 8)
     try:
-        return await async_retry_llm_call(
+        raw = await async_retry_llm_call(
             lambda: client.system_user(
-                PROSODY_SYSTEM_PROMPT,
+                PROSODY_SYSTEM_PROMPT + "\n\n/no_think",
                 f"Add prosody markers to this spoken podcast segment:\n\n{text}",
                 temperature=AUDIO_DESIGNER_TEMPERATURE,
-                max_tokens=max(512, count_words(text) * 4),
+                max_tokens=budget,
             ),
             logger_inst=logger,
         )
+        cleaned = strip_llm_noise(raw)
+        if not cleaned.strip():
+            logger.warning("LLM returned empty output for '%s' — using rule-based", seg_name)
+            return _rule_based_markers(text)
+        return cleaned
     except Exception as exc:
         logger.warning("LLM prosody error in '%s': %s — using rule-based", seg_name, exc)
         return _rule_based_markers(text)
@@ -94,11 +116,29 @@ async def run_audio_designer_node(state: dict) -> dict:
         prefix = f"{cue}\n" if cue else ""
 
         # 2. Add prosody markers (LLM or rule-based)
-        text = seg.get("text", "")
+        raw_text = seg.get("text", "")
+        # Strip citation markers before LLM processing — prevents the LLM from
+        # mangling [SRC-N] into spoken text like "SRC 3"
+        text = re.sub(r'\[(?:SRC[-\s]?\d+[,\s]*)+\]', '', raw_text, flags=re.IGNORECASE)
+        text = re.sub(r'\s{2,}', ' ', text).strip()
         if dry_run or not client:
             marked_text = _rule_based_markers(text)
         else:
             marked_text = await _llm_markers(client, seg_name, text)
+
+        # Guard against LLM truncation/refusal: if output collapsed, fall back to
+        # rule-based markers on the original text so the segment isn't lost.
+        original_words = count_words(text)
+        marked_words = count_words(marked_text)
+        if not marked_text.strip() and text.strip():
+            logger.warning("Prosody marking produced empty output for '%s' — keeping original text", seg_name)
+            marked_text = _rule_based_markers(text) or text
+        elif original_words >= 20 and marked_words < int(original_words * 0.7):
+            logger.warning(
+                "Prosody output for '%s' dropped %d→%d words — likely truncation; falling back to rule-based.",
+                seg_name, original_words, marked_words,
+            )
+            marked_text = _rule_based_markers(raw_text) or raw_text
 
         new_seg = dict(seg)
         new_seg["text"] = prefix + marked_text
