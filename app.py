@@ -148,6 +148,14 @@ class VideoRequest(BaseModel):
     title: str = "Podcast Episode"
 
 
+class VisualRegenRequest(BaseModel):
+    run_id: str
+    cue_index: int
+    prompt: Optional[str] = None    # None → keep existing prompt, just re-seed
+    seed: Optional[int] = None      # None → random new seed
+    use_cogvideox: bool = True      # if False, skip the t2v pass for this cue
+
+
 class EstimateRequest(BaseModel):
     minutes: int = 5
     tts_backend: str = "kokoro"
@@ -758,6 +766,309 @@ async def generate_video(req: VideoRequest):
                 break
             else:
                 yield json.dumps({"done": False, "pct": item.get("pct", 0), "msg": item.get("msg", "")})
+            await asyncio.sleep(0)
+
+    return EventSourceResponse(event_stream())
+
+
+# ── Visual cues (per-cue thumbnails + re-roll) ────────────────────────────────
+
+def _find_episode_dir(run_id: str) -> Optional[Path]:
+    """Locate an episode directory by run_id (or directory name)."""
+    for meta_path in OUTPUTS_DIR.rglob("metadata.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if meta.get("run_id") == run_id or meta_path.parent.name == run_id:
+            return meta_path.parent
+    return None
+
+
+@app.get("/api/episodes/{run_id}/visuals")
+async def list_visual_cues(run_id: str):
+    """Return the [VISUAL:] cues for an episode plus per-cue thumbnail URLs.
+
+    The thumbnail is the SDXL still that visual_agent rendered for this cue
+    interval (under _visual_images/). If a CogVideoX clip exists in the
+    cache, its URL is returned too.
+    """
+    ep_dir = _find_episode_dir(run_id)
+    if ep_dir is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    cues_path = ep_dir / "visual_cues.json"
+    if not cues_path.exists():
+        return {"cues": [], "rel": ep_dir.relative_to(OUTPUTS_DIR).as_posix()}
+
+    try:
+        cues = json.loads(cues_path.read_text(encoding="utf-8"))
+    except Exception:
+        cues = []
+
+    rel = ep_dir.relative_to(OUTPUTS_DIR).as_posix()
+
+    # Lazy import so the module isn't loaded for non-visual endpoints.
+    from agents.visual_agent import _cog_cache_key
+    from constants import VISUAL_STYLE_SUFFIX
+
+    enriched: list[dict] = []
+    for i, cue in enumerate(cues):
+        # Interval index in build_visual_bed isn't 1:1 with cue index because
+        # the planner emits leading + trailing gap intervals around the cues.
+        # We don't know the planner's interval id without re-running the plan,
+        # so we expose the cue ordering and let the regenerate endpoint do
+        # the lookup. Thumbnail name follows the planner's naming scheme.
+        prompt = (cue.get("prompt") or "").strip()
+        full_prompt = prompt if prompt.endswith(VISUAL_STYLE_SUFFIX) else f"{prompt}{VISUAL_STYLE_SUFFIX}"
+        # Try a few seeds — the bed used 2000+i for CogVideoX cache; a re-roll
+        # may have used a fresh random seed. We surface whichever clip exists.
+        clip_url = None
+        cache_dir = ep_dir / "_visual_cogvideox_cache"
+        if cache_dir.exists():
+            # Prefer the most recent clip whose hash matches *some* seed for
+            # this prompt. Cheaper: just glob the cache and pick most-recent.
+            matches = sorted(cache_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for cand in matches:
+                # Recompute hash for default seed to identify the canonical clip.
+                if cand.name.startswith(_cog_cache_key(full_prompt, 2000 + i)):
+                    clip_url = f"/outputs/{rel}/_visual_cogvideox_cache/{cand.name}"
+                    break
+
+        enriched.append({
+            "cue_index": i,
+            "prompt": prompt,
+            "start_ms": cue.get("start_ms", 0),
+            "end_ms": cue.get("end_ms", 0),
+            "thumbnail_url": None,  # filled below if the planner-named PNG exists
+            "clip_url": clip_url,
+        })
+
+    # Best-effort thumbnail lookup. The planner inserts leading/trailing gap
+    # intervals before the first cue, so cue N maps to interval (lead_gaps + N).
+    # We don't know lead_gaps without re-planning, but we can scan
+    # _visual_images/ for PNGs and match by chronological cue order: the cue
+    # PNGs are interleaved with gap PNGs in start_ms order.
+    images_dir = ep_dir / "_visual_images"
+    if images_dir.exists():
+        # Re-derive interval ordering using start_ms — we need both cues and
+        # gaps. Without re-running the planner, fall back to: scan images dir,
+        # sort by name (matches planner's "interval_NNN.png"), and pick the
+        # ones whose start_ms aligns with each cue's start_ms.
+        # Simplest: zip cues with the largest-N PNG that doesn't precede an
+        # earlier cue's match. The planner is deterministic, so we re-run it
+        # cheaply here to get the exact interval index per cue.
+        try:
+            from agents.visual_agent import _plan_intervals
+            # Read script_segments from metadata so gap-prompt derivation matches
+            meta = json.loads((ep_dir / "metadata.json").read_text(encoding="utf-8"))
+            script_segs = meta.get("segments") or []
+            # Audio duration (ms) — use end of last whisper word, or last cue
+            ww_path = ep_dir / "whisper_words.json"
+            if ww_path.exists():
+                ww = json.loads(ww_path.read_text(encoding="utf-8"))
+                duration_ms = int((ww[-1]["end"] if ww else 0) * 1000)
+            else:
+                duration_ms = max((c.get("end_ms", 0) for c in cues), default=0)
+            intervals = _plan_intervals(cues, duration_ms, script_segs)
+            cue_iter = iter(range(len(cues)))
+            for iv_idx, iv in enumerate(intervals):
+                if iv["kind"] != "cue":
+                    continue
+                try:
+                    cue_idx = next(cue_iter)
+                except StopIteration:
+                    break
+                png = images_dir / f"interval_{iv_idx:03d}.png"
+                if png.exists():
+                    enriched[cue_idx]["thumbnail_url"] = f"/outputs/{rel}/_visual_images/{png.name}"
+                    enriched[cue_idx]["interval_index"] = iv_idx
+        except Exception:
+            pass
+
+    return {"cues": enriched, "rel": rel}
+
+
+@app.post("/api/visuals/regenerate")
+async def regenerate_visual_cue(req: VisualRegenRequest):
+    """Re-roll a single [VISUAL:] cue and re-stitch the bed.
+
+    1. Update visual_cues.json with the new prompt (if provided).
+    2. Re-run visual_agent on JUST this interval — SDXL still + (optional)
+       CogVideoX clip with a fresh seed.
+    3. Re-stitch _visual_bed.mp4 from the existing per-interval clips on disk
+       so the rest of the bed isn't regenerated.
+    Streams progress via SSE.
+    """
+    ep_dir = _find_episode_dir(req.run_id)
+    if ep_dir is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+
+    cues_path = ep_dir / "visual_cues.json"
+    if not cues_path.exists():
+        raise HTTPException(status_code=404, detail="visual_cues.json not found for this episode")
+
+    try:
+        cues = json.loads(cues_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not parse visual_cues.json: {exc}")
+
+    if req.cue_index < 0 or req.cue_index >= len(cues):
+        raise HTTPException(status_code=400, detail=f"cue_index {req.cue_index} out of range (0..{len(cues)-1})")
+
+    # Apply prompt edit immediately so the on-disk record matches what the
+    # user asked for, even if the regen below crashes mid-way.
+    if req.prompt is not None:
+        cues[req.cue_index]["prompt"] = req.prompt
+        cues_path.write_text(json.dumps(cues, indent=2), encoding="utf-8")
+
+    async def event_stream():
+        import queue, threading, random
+
+        q: queue.Queue = queue.Queue()
+
+        def progress_cb(msg: str, pct: int) -> None:
+            q.put({"msg": msg, "pct": pct})
+
+        def _run():
+            try:
+                from agents.visual_agent import (
+                    _SDXLBackend, _CogVideoXBackend, _ken_burns_clip,
+                    _stretch_clip_to_duration, _cog_cache_dir, _cog_cache_key,
+                    _plan_intervals, _concat_with_crossfade,
+                )
+                from constants import (
+                    SDXL_WIDTH, SDXL_HEIGHT, VISUAL_STYLE_SUFFIX,
+                )
+
+                # Re-derive intervals so we know which interval index this cue
+                # maps to (the planner interleaves gap intervals).
+                meta = json.loads((ep_dir / "metadata.json").read_text(encoding="utf-8"))
+                script_segs = meta.get("segments") or []
+                ww_path = ep_dir / "whisper_words.json"
+                if ww_path.exists():
+                    ww = json.loads(ww_path.read_text(encoding="utf-8"))
+                    duration_ms = int((ww[-1]["end"] if ww else 0) * 1000)
+                else:
+                    duration_ms = max((c.get("end_ms", 0) for c in cues), default=0)
+                intervals = _plan_intervals(cues, duration_ms, script_segs)
+
+                # Find the interval id for this cue (Nth 'cue' interval).
+                target_iv_idx = None
+                cue_seen = -1
+                for iv_idx, iv in enumerate(intervals):
+                    if iv["kind"] == "cue":
+                        cue_seen += 1
+                        if cue_seen == req.cue_index:
+                            target_iv_idx = iv_idx
+                            break
+                if target_iv_idx is None:
+                    q.put({"done": True, "error": "Could not locate cue in interval plan"})
+                    return
+
+                iv = intervals[target_iv_idx]
+                prompt = (iv.get("prompt") or "").strip()
+                if not prompt.endswith(VISUAL_STYLE_SUFFIX):
+                    prompt = f"{prompt}{VISUAL_STYLE_SUFFIX}"
+                seed = req.seed if req.seed is not None else random.randint(1, 1_000_000)
+
+                images_dir = ep_dir / "_visual_images"
+                clips_dir = ep_dir / "_visual_clips"
+                images_dir.mkdir(parents=True, exist_ok=True)
+                clips_dir.mkdir(parents=True, exist_ok=True)
+
+                # ── SDXL still ──
+                progress_cb(f"Loading SDXL...", 5)
+                if not _SDXLBackend.load():
+                    q.put({"done": True, "error": "SDXL failed to load"})
+                    return
+                try:
+                    progress_cb("Generating still...", 25)
+                    img = _SDXLBackend.generate(prompt, seed=seed)
+                    if img is None:
+                        q.put({"done": True, "error": "SDXL returned no image"})
+                        return
+                    img_path = images_dir / f"interval_{target_iv_idx:03d}.png"
+                    img.save(str(img_path), "PNG")
+                finally:
+                    _SDXLBackend.unload()
+
+                # Ken-Burns wrap (used as fallback if CogVideoX is unavailable)
+                progress_cb("Rendering Ken-Burns clip...", 45)
+                kb_clip = clips_dir / f"interval_{target_iv_idx:03d}.mp4"
+                if not _ken_burns_clip(img_path, iv["end_ms"] - iv["start_ms"], kb_clip):
+                    q.put({"done": True, "error": "Ken-Burns render failed"})
+                    return
+                final_clip = kb_clip
+
+                # ── CogVideoX clip (if requested + available) ──
+                if req.use_cogvideox and _CogVideoXBackend.load():
+                    try:
+                        progress_cb("Generating t2v clip (this can take many minutes)...", 55)
+                        raw = _cog_cache_dir(ep_dir) / f"{_cog_cache_key(prompt, seed)}.mp4"
+                        if _CogVideoXBackend.generate(prompt, raw, seed=seed):
+                            stretched = clips_dir / f"interval_{target_iv_idx:03d}_cog.mp4"
+                            if _stretch_clip_to_duration(raw, stretched, iv["end_ms"] - iv["start_ms"]):
+                                final_clip = stretched
+                    finally:
+                        _CogVideoXBackend.unload()
+
+                # ── Re-stitch the bed using existing on-disk per-interval clips ──
+                progress_cb("Re-stitching visual bed...", 90)
+                ordered_clips: list[Path] = []
+                for iv_idx in range(len(intervals)):
+                    cog_path = clips_dir / f"interval_{iv_idx:03d}_cog.mp4"
+                    kb_path = clips_dir / f"interval_{iv_idx:03d}.mp4"
+                    if iv_idx == target_iv_idx:
+                        ordered_clips.append(final_clip)
+                    elif cog_path.exists():
+                        ordered_clips.append(cog_path)
+                    elif kb_path.exists():
+                        ordered_clips.append(kb_path)
+                    else:
+                        # Per-interval clip got cleaned up after the original
+                        # bed render — we can rebuild Ken-Burns from the
+                        # cached PNG without re-running SDXL.
+                        png = images_dir / f"interval_{iv_idx:03d}.png"
+                        if png.exists():
+                            rebuild = clips_dir / f"interval_{iv_idx:03d}.mp4"
+                            iv_other = intervals[iv_idx]
+                            if _ken_burns_clip(png, iv_other["end_ms"] - iv_other["start_ms"], rebuild):
+                                ordered_clips.append(rebuild)
+
+                if not ordered_clips:
+                    q.put({"done": True, "error": "No per-interval clips on disk to stitch"})
+                    return
+
+                bed_path = ep_dir / "_visual_bed.mp4"
+                if not _concat_with_crossfade(ordered_clips, bed_path):
+                    q.put({"done": True, "error": "Bed stitch failed"})
+                    return
+
+                rel = ep_dir.relative_to(OUTPUTS_DIR).as_posix()
+                q.put({
+                    "done": True,
+                    "thumbnail_url": f"/outputs/{rel}/_visual_images/interval_{target_iv_idx:03d}.png",
+                    "bed_url": f"/outputs/{rel}/_visual_bed.mp4",
+                    "interval_index": target_iv_idx,
+                    "seed": seed,
+                })
+            except Exception as exc:
+                q.put({"done": True, "error": str(exc)})
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        while True:
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+                continue
+            if item.get("done"):
+                yield json.dumps(item)
+                break
+            yield json.dumps({"done": False, "pct": item.get("pct", 0), "msg": item.get("msg", "")})
             await asyncio.sleep(0)
 
     return EventSourceResponse(event_stream())

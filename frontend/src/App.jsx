@@ -34,8 +34,12 @@ function App() {
   const gen = useGeneration();
   const [activeTab, setActiveTab] = useState('generate');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Sticky across this page lifetime — controls whether the video step
+  // auto-fires after audio finishes. Reset on each new generation start.
+  const [autoVideo, setAutoVideo] = useState(false);
 
   const handleGenerate = (formData) => {
+    setAutoVideo(!!formData.auto_video);
     gen.generate({
       ...formData,
       llm_url: settings.llmUrl,
@@ -137,6 +141,7 @@ function App() {
                         results={gen.results}
                         script={gen.script}
                         sources={gen.sources}
+                        autoVideo={autoVideo}
                       />
                     </motion.div>
                   )}

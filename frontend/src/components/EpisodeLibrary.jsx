@@ -18,6 +18,7 @@ import { Input } from './ui/Input';
 import AudioPlayer from './AudioPlayer';
 import ScriptViewer from './ScriptViewer';
 import { VideoSection } from './ResultsPanel';
+import VisualCuesPanel from './VisualCuesPanel';
 
 function formatDate(iso) {
   if (!iso) return '';
@@ -221,6 +222,7 @@ export default function EpisodeLibrary() {
                   metadata: { episode_title: detail.episode_title },
                 }}
               />
+              <VisualCuesPanel runId={selected} />
             </div>
           )}
 

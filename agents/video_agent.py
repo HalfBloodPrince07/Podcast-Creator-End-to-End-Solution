@@ -52,6 +52,11 @@ DIM_CLR  = (100, 60, 180)   # dimmed purple for labels
 # FFmpeg waveform colour — muted violet so screen-blend stays dark on silence
 WAVE_CLR1 = "0x7c3aed"   # deep violet (not too bright)
 
+# Toggle the waveform overlay. Disabled while we redesign the lower-third
+# treatment; flip back to True (and don't forget to update _render_video) to
+# restore the showwaves+gblur+screen-blend chain.
+WAVEFORM_ENABLED = False
+
 
 # ── Path helpers ───────────────────────────────────────────────────────────────
 
@@ -342,15 +347,24 @@ def _render_video(bg_png: Path, audio: Path, out: Path, visual_bed: Optional[Pat
         bg_input = ["-loop", "1", "-framerate", str(FPS), "-i", str(bg_png)]
         bg_pre = "[0:v]"
 
-    filt = (
-        f"[1:a]showwaves=s={W}x{VIS_H}:mode=line"
-        f":colors={WAVE_CLR1}:rate={FPS}:scale=sqrt[wraw];"
-        "[wraw]split=2[w1][w2];"
-        "[w2]gblur=sigma=3[wblur];"
-        "[w1][wblur]blend=all_mode=screen[wglow];"
-        "[wglow]colorkey=color=black:similarity=0.08:blend=0.0[walpha];"
-        f"{bg_pre}[walpha]overlay=0:{VIS_Y}:format=auto[vout]"
-    )
+    if WAVEFORM_ENABLED:
+        # Waveform: mode=line draws vertical bars (clean, no area fill).
+        # colorkey removes the black background -> RGBA stream.
+        # overlay composites the transparent waveform onto the dark background.
+        filt = (
+            f"[1:a]showwaves=s={W}x{VIS_H}:mode=line"
+            f":colors={WAVE_CLR1}:rate={FPS}:scale=sqrt[wraw];"
+            "[wraw]split=2[w1][w2];"
+            "[w2]gblur=sigma=3[wblur];"
+            "[w1][wblur]blend=all_mode=screen[wglow];"
+            "[wglow]colorkey=color=black:similarity=0.08:blend=0.0[walpha];"
+            f"{bg_pre}[walpha]overlay=0:{VIS_Y}:format=auto[vout]"
+        )
+    else:
+        # Waveform disabled — pass the background straight through. `null` is
+        # FFmpeg's no-op video filter; we still go through filter_complex so
+        # the rest of the cmd (map [vout], encoder args) stays unchanged.
+        filt = f"{bg_pre}null[vout]"
 
     gpu = _gpu_encode()
     cmd = [

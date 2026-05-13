@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { motion, AnimatePresence } from 'framer-motion';
 import { fetchEventSource } from '@microsoft/fetch-event-source';
@@ -7,21 +7,25 @@ import { Play, Film, RotateCcw, Download, AlertCircle, BookOpen, Headphones } fr
 import AudioPlayer from './AudioPlayer';
 import ScriptViewer from './ScriptViewer';
 import SourcesList from './SourcesList';
+import VisualCuesPanel from './VisualCuesPanel';
 import Card, { CardHeader, CardTitle } from './ui/Card';
 import Button from './ui/Button';
 import Badge from './ui/Badge';
 
-export function VideoSection({ results }) {
+export function VideoSection({ results, autoVideo = false }) {
   const initialUrl = results?.video_url || null;
   const [status, setStatus] = useState(initialUrl ? 'done' : 'idle'); // idle | generating | done | error
   const [progress, setProgress] = useState(0);
   const [progressMsg, setProgressMsg] = useState('');
   const [videoUrl, setVideoUrl] = useState(initialUrl);
   const [errorMsg, setErrorMsg] = useState('');
+  // Guard so the auto-fire only happens once per results payload — re-renders
+  // (status changes, parent re-renders) must not retrigger generation.
+  const autoFiredRef = useRef(false);
 
-  if (!results?.audio_url) return null;
-
-  const handleGenerate = async () => {
+  // useCallback so the auto-fire effect can depend on a stable reference.
+  const handleGenerate = useCallback(async () => {
+    if (!results?.audio_url) return;
     setStatus('generating');
     setProgress(0);
     setProgressMsg('Starting…');
@@ -61,7 +65,26 @@ export function VideoSection({ results }) {
         setStatus('error');
       }
     }
-  };
+  }, [results?.audio_url, results?.srt_url, results?.metadata?.episode_title]);
+
+  // Reset the auto-fire guard whenever a fresh `results` payload arrives
+  // (i.e. the user kicked off a new generation).
+  useEffect(() => { autoFiredRef.current = false; }, [results?.audio_url]);
+
+  // Auto-fire video gen exactly once when:
+  //   - the user enabled "Auto-generate video" on the form,
+  //   - we have a fresh audio result with no existing video,
+  //   - and we haven't already fired for this payload.
+  useEffect(() => {
+    if (!autoVideo) return;
+    if (autoFiredRef.current) return;
+    if (status !== 'idle') return;
+    if (!results?.audio_url || results?.video_url) return;
+    autoFiredRef.current = true;
+    handleGenerate();
+  }, [autoVideo, status, results?.audio_url, results?.video_url, handleGenerate]);
+
+  if (!results?.audio_url) return null;
 
   return (
     <section style={{ marginTop: 'var(--space-6)' }}>
@@ -254,7 +277,7 @@ function SectionHeading({ icon, title, accent }) {
   );
 }
 
-export default function ResultsPanel({ results, script, sources }) {
+export default function ResultsPanel({ results, script, sources, autoVideo = false }) {
   const hasContent = results || script.length > 0 || sources.length > 0;
   if (!hasContent) return null;
 
@@ -281,7 +304,8 @@ export default function ResultsPanel({ results, script, sources }) {
             </motion.div>
           )}
 
-          {results?.audio_url && <VideoSection results={results} />}
+          {results?.audio_url && <VideoSection results={results} autoVideo={autoVideo} />}
+          {results?.metadata?.run_id && <VisualCuesPanel runId={results.metadata.run_id} />}
 
           {results?.show_notes && (
             <motion.div

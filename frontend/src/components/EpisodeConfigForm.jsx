@@ -32,6 +32,7 @@ export default function EpisodeConfigForm({ isGenerating, onGenerate, onStop }) 
   const [constraints, setConstraints] = useState('');
   const [dryRun, setDryRun] = useState(false);
   const [pauseForReview, setPauseForReview] = useState(false);
+  const [autoVideo, setAutoVideo] = useState(false);
   const [ttsBackend, setTtsBackend] = useState('kokoro');
   const [voiceGender, setVoiceGender] = useState('female');
   const [voiceId, setVoiceId] = useState('');
@@ -54,6 +55,7 @@ export default function EpisodeConfigForm({ isGenerating, onGenerate, onStop }) 
       timeline, constraints,
       dry_run: dryRun,
       pause_for_review: pauseForReview,
+      auto_video: autoVideo,
       multi_voice: false,
       tts_backend: ttsBackend,
       voice_gender: voiceGender,
@@ -267,6 +269,12 @@ export default function EpisodeConfigForm({ isGenerating, onGenerate, onStop }) 
                 onChange={setPauseForReview}
                 label="Review script before TTS"
                 description="Pause after writing so you can edit segments before GPU minutes are spent"
+              />
+              <Checkbox
+                checked={autoVideo}
+                onChange={setAutoVideo}
+                label="Auto-generate video"
+                description="Render the 1080p video (AI visual bed + waveform + subtitles) right after audio finishes — no extra click."
               />
             </div>
           </div>

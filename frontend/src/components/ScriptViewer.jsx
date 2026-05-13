@@ -1,11 +1,80 @@
-import { useState } from 'react';
+import { useState, Fragment } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronDown, FileText } from 'lucide-react';
+import { ChevronDown, FileText, Image as ImageIcon } from 'lucide-react';
 import Badge from './ui/Badge';
 
 function countWords(text) {
   if (!text) return 0;
   return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+// Render segment text with [VISUAL: ...] and [CUE: ...] markers as inline chips
+// so visual/audio direction stands out from spoken text.
+function renderAnnotatedText(text) {
+  if (!text) return null;
+  // Match [VISUAL: ...] OR [CUE: ...]; capture the whole tag.
+  const re = /\[(VISUAL|CUE):\s*([^\]]+)\]/gi;
+  const parts = [];
+  let last = 0;
+  let m;
+  let i = 0;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) parts.push({ kind: 'text', value: text.slice(last, m.index), key: `t${i++}` });
+    parts.push({ kind: m[1].toUpperCase(), value: m[2].trim(), key: `c${i++}` });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push({ kind: 'text', value: text.slice(last), key: `t${i++}` });
+
+  return parts.map((p) => {
+    if (p.kind === 'text') return <Fragment key={p.key}>{p.value}</Fragment>;
+    if (p.kind === 'VISUAL') {
+      return (
+        <span
+          key={p.key}
+          title={p.value}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            padding: '1px 6px',
+            margin: '0 2px',
+            borderRadius: 'var(--radius-pill)',
+            background: 'rgba(124, 92, 255, 0.15)',
+            color: 'var(--brand-300)',
+            fontSize: 'var(--text-2xs)',
+            fontWeight: 600,
+            border: '1px solid rgba(124, 92, 255, 0.35)',
+            verticalAlign: 'middle',
+          }}
+        >
+          <ImageIcon size={10} />
+          <span style={{ maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {p.value}
+          </span>
+        </span>
+      );
+    }
+    // CUE
+    return (
+      <span
+        key={p.key}
+        style={{
+          display: 'inline-block',
+          padding: '1px 6px',
+          margin: '0 2px',
+          borderRadius: 'var(--radius-pill)',
+          background: 'rgba(77, 208, 225, 0.12)',
+          color: 'var(--accent-cyan)',
+          fontSize: 'var(--text-2xs)',
+          fontWeight: 600,
+          border: '1px solid rgba(77, 208, 225, 0.3)',
+          verticalAlign: 'middle',
+        }}
+      >
+        ♪ {p.value}
+      </span>
+    );
+  });
 }
 
 export default function ScriptViewer({ script }) {
@@ -126,7 +195,7 @@ function ScriptSegmentRow({ seg, index }) {
                 lineHeight: 'var(--leading-relaxed)',
               }}
             >
-              {seg.text}
+              {renderAnnotatedText(seg.text)}
             </div>
           </motion.div>
         )}
