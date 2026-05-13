@@ -19,6 +19,7 @@ from utils import (
     seconds_to_hms,
     seconds_to_srt_timestamp,
     srt_entries_from_segments,
+    srt_entries_from_whisper,
     build_srt,
     count_words,
     highlight_citations_html,
@@ -207,6 +208,15 @@ def _build_metadata(
         "source_count":      len(state.get("sources", [])),
         "sources":           state.get("sources", []),
 
+        # Full segment payloads — needed for per-segment regenerate
+        "segments":          segments,
+        "narrative_arc":     state.get("narrative_arc", ""),
+
+        # Original generation knobs for regenerate
+        "tts_backend":       state.get("tts_backend"),
+        "voice_gender":      state.get("voice_gender"),
+        "voice_id":          state.get("voice_id"),
+
         # Output
         "output_dir":        str(cfg.output_dir),
         "run_id":            cfg.run_id,
@@ -254,30 +264,43 @@ async def run_assembler_node(state: dict) -> dict:
     tts_result = state.get("tts_results", {})
 
     logger.info("Generating SRT transcript...")
-    srt_entries = srt_entries_from_segments(segments)
+    whisper_words = state.get("whisper_words") or []
+    if whisper_words:
+        logger.info("Using Whisper word-level timings (%d words)", len(whisper_words))
+        srt_entries = srt_entries_from_whisper(whisper_words)
+    else:
+        logger.info("Whisper timings unavailable — using estimated segment timings")
+        srt_entries = srt_entries_from_segments(segments)
     srt_content = build_srt(srt_entries)
     
     # Delegate file writing to a thread
     def _write_files():
         srt_path = save_text(out / "transcript.srt", srt_content)
-        
+
         txt_content = _build_plain_transcript(state, cfg, srt_entries)
         txt_path = save_text(out / "transcript.txt", txt_content)
-        
+
         show_notes = _build_show_notes(state, cfg, tts_result)
         notes_path = save_text(out / "show_notes.md", show_notes)
-        
+
         audio_path = tts_result.get("audio_path")
         duration_s = _get_audio_duration(audio_path) or sum(
             s.get("target_seconds", 0) for s in segments
         )
-        
+
+        # YouTube-ready thumbnail (graceful failure if Pillow missing)
+        from agents.thumbnail_agent import generate_thumbnail
+        title = state.get("episode_title") or cfg.episode_title
+        thumb_path = generate_thumbnail(title, out / "thumbnail.png")
+
         metadata = _build_metadata(state, cfg, tts_result, duration_s, srt_path, txt_path, notes_path)
+        if thumb_path:
+            metadata["thumbnail_path"] = thumb_path
         meta_path = save_json(out / "metadata.json", metadata)
-        
+
         html_content = _build_html_transcript(segments)
         html_path = save_text(out / "transcript.html", html_content)
-        
+
         return {
             "output_dir":     str(out),
             "audio_path":     audio_path,
@@ -286,6 +309,7 @@ async def run_assembler_node(state: dict) -> dict:
             "notes_path":     str(notes_path),
             "meta_path":      str(meta_path),
             "html_path":      str(html_path),
+            "thumbnail_path": thumb_path,
             "tts_text_path":  tts_result.get("tts_text_path"),
             "metadata":       metadata,
         }
