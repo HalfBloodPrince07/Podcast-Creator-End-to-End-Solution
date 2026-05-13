@@ -75,6 +75,28 @@ def get_logger(name: str) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
+# Structured error records (surface failures to the frontend via state['errors'])
+# ---------------------------------------------------------------------------
+def make_error_record(
+    node: str,
+    message: str,
+    severity: str = "warning",
+    details: dict | None = None,
+) -> dict:
+    """Build a single structured error record for state['errors']."""
+    import time as _t
+    rec = {
+        "node": node,
+        "severity": severity,         # "info" | "warning" | "error"
+        "message": str(message)[:500],
+        "ts": _t.time(),
+    }
+    if details:
+        rec["details"] = details
+    return rec
+
+
+# ---------------------------------------------------------------------------
 # Timestamp helpers
 # ---------------------------------------------------------------------------
 def seconds_to_srt_timestamp(seconds: float) -> str:
@@ -149,7 +171,10 @@ def strip_markers(text: str) -> str:
     text = re.sub(r'\[PAUSE\s+[\d.]+m?s\]', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'\[CUE:[^\]]*\]', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\[/?EMPHASIS\]', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\[SRC-\d+\]', '', text)
+    # Remove citation markers: [SRC-N], [SRC-N, SRC-M], [SRC N], etc.
+    text = re.sub(r'\[(?:SRC[-\s]?\d+[,\s]*)+\]', '', text, flags=re.IGNORECASE)
+    # Also catch bare SRC-N / SRC N that LLMs sometimes write without brackets
+    text = re.sub(r'\bSRC[-\s]\d+\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s{2,}', ' ', text)
     return text.strip()
 
@@ -334,6 +359,58 @@ async def async_retry_llm_call(
                 )
             await asyncio.sleep(wait)
     raise RuntimeError("async_retry_llm_call: unreachable")
+
+
+def srt_entries_from_whisper(
+    words: list[dict],
+    max_chunk_s: float = 10.0,
+    max_words_per_chunk: int = 14,
+) -> list[dict]:
+    """
+    Build SRT entries from Whisper word-level timings.
+
+    Each word is a dict with keys: 'word' (str), 'start' (float), 'end' (float).
+    Chunks are flushed when ANY of:
+      - chunk duration >= max_chunk_s
+      - chunk reaches max_words_per_chunk
+      - last word ends with sentence punctuation . ! ?
+    """
+    entries: list[dict] = []
+    if not words:
+        return entries
+
+    buf: list[dict] = []
+    idx = 1
+
+    def _flush():
+        nonlocal idx, buf
+        if not buf:
+            return
+        text = "".join(w["word"] for w in buf).strip()
+        if text:
+            entries.append({
+                "index": idx,
+                "start_s": float(buf[0]["start"]),
+                "end_s": float(buf[-1]["end"]),
+                "text": text,
+            })
+            idx += 1
+        buf = []
+
+    for w in words:
+        buf.append(w)
+        token = w["word"].strip()
+        duration = float(buf[-1]["end"]) - float(buf[0]["start"])
+        ends_sentence = token.endswith((".", "!", "?"))
+        if (
+            ends_sentence
+            or duration >= max_chunk_s
+            or len(buf) >= max_words_per_chunk
+        ):
+            _flush()
+
+    _flush()
+    return entries
 
 
 def srt_entries_from_segments(segments: list[dict]) -> list[dict]:
