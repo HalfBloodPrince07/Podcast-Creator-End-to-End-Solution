@@ -1,107 +1,246 @@
-import { useEffect, useRef } from 'react';
+import { useMemo, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Loader2 } from 'lucide-react';
+import {
+  Sparkles, Search, PenTool, ShieldCheck, Music, Mic, Layers,
+  AlertTriangle, RefreshCw, Activity,
+} from 'lucide-react';
 
-import ActiveAgentAvatar from './ActiveAgentAvatar';
+import Card, { CardHeader, CardTitle } from './ui/Card';
+import StageTimeline from './ui/StageTimeline';
+import Button from './ui/Button';
+import Badge from './ui/Badge';
 
-export default function ProgressPanel({ isGenerating, currentStage, progress, logs, lastError, onRetry }) {
-  const logEndRef = useRef(null);
-  const containerRef = useRef(null);
+/**
+ * ProgressPanel — Vercel-style pipeline tracker.
+ *
+ * Parses the flat `logs` array (lines look like `[Stage Name] message`)
+ * into per-stage buckets, derives status from `currentStage`,
+ * and renders the result through the StageTimeline primitive.
+ */
 
-  // Auto scroll logic
-  useEffect(() => {
-    if (logEndRef.current && containerRef.current) {
-      const container = containerRef.current;
-      // Scroll if we're near the bottom to avoid interrupting user scrolling up
-      const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
-      if (isNearBottom || logs.length < 5) {
-        logEndRef.current.scrollIntoView({ behavior: 'smooth' });
-      }
+const PIPELINE_STAGES = [
+  { id: 'topic_refine', label: 'Topic refinement', match: /refin(e|ing) topic/i, icon: <Sparkles size={12} /> },
+  { id: 'search',       label: 'Research',         match: /research/i,            icon: <Search size={12} /> },
+  { id: 'write',        label: 'Script writing',   match: /draft(ing)? script|writing/i, icon: <PenTool size={12} /> },
+  { id: 'fact_check',   label: 'Fact-check',       match: /fact[\s-]?check/i,     icon: <ShieldCheck size={12} /> },
+  { id: 'audio_design', label: 'Audio design',     match: /audio design/i,        icon: <Music size={12} /> },
+  { id: 'tts',          label: 'Speech synthesis', match: /generating audio|tts/i, icon: <Mic size={12} /> },
+  { id: 'assemble',     label: 'Assembly',         match: /assembl(ing|y)/i,      icon: <Layers size={12} /> },
+];
+
+function buildStageRows({ logs, currentStage, isGenerating, lastError, progress }) {
+  const currentIdx = PIPELINE_STAGES.findIndex((s) => s.match.test(currentStage || ''));
+  const hasResults = progress >= 100;
+
+  // Group logs by bracket prefix
+  const buckets = PIPELINE_STAGES.map(() => []);
+  for (const line of logs) {
+    const m = line.match(/^\[(.+?)\]\s*(.*)$/);
+    if (!m) continue;
+    const tag = m[1];
+    const idx = PIPELINE_STAGES.findIndex((s) => s.match.test(tag));
+    if (idx >= 0) {
+      buckets[idx].push(m[2] || line);
     }
-  }, [logs]);
+  }
+
+  return PIPELINE_STAGES.map((stage, i) => {
+    let status = 'pending';
+    if (hasResults) {
+      status = 'done';
+    } else if (currentIdx >= 0) {
+      if (i < currentIdx)        status = 'done';
+      else if (i === currentIdx) status = lastError ? 'error' : (isGenerating ? 'active' : 'done');
+      else                        status = 'pending';
+    } else if (buckets[i].length > 0) {
+      status = 'done';
+    }
+    return {
+      ...stage,
+      status,
+      logs: buckets[i],
+    };
+  });
+}
+
+// Live ticker showing elapsed seconds since `since`
+function useElapsed(active, since) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  if (!since) return '';
+  const s = Math.max(0, Math.floor((now - since) / 1000));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m > 0 ? `${m}m ${String(r).padStart(2, '0')}s` : `${r}s`;
+}
+
+export default function ProgressPanel({
+  isGenerating,
+  currentStage,
+  progress,
+  logs,
+  lastError,
+  onRetry,
+}) {
+  // Track when generation started for elapsed counter
+  const startedAtRef = useRef(null);
+  useEffect(() => {
+    if (isGenerating && !startedAtRef.current) {
+      startedAtRef.current = Date.now();
+    }
+    if (!isGenerating && progress >= 100) {
+      // Keep startedAt so user can see total elapsed in idle state
+    }
+    if (!isGenerating && progress === 0) {
+      startedAtRef.current = null;
+    }
+  }, [isGenerating, progress]);
+
+  const elapsed = useElapsed(isGenerating, startedAtRef.current);
+  const stages = useMemo(
+    () => buildStageRows({ logs, currentStage, isGenerating, lastError, progress }),
+    [logs, currentStage, isGenerating, lastError, progress],
+  );
+
+  const stageLabel = currentStage || (isGenerating ? 'Initialising' : 'Idle');
 
   return (
-    <motion.div className="glass-panel" layout>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem' }}>
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '0.5rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-            <h2 style={{ fontSize: '1.4rem', margin: 0, fontWeight: 600 }}>Pipeline Progress</h2>
+    <Card padding="none">
+      <CardHeader>
+        <CardTitle eyebrow="Pipeline">
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+            {stageLabel}
             {isGenerating && (
-              <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 2, ease: "linear" }}>
-                <Loader2 size={20} color="var(--primary-light)" />
-              </motion.div>
+              <motion.span
+                animate={{ rotate: 360 }}
+                transition={{ repeat: Infinity, duration: 1.4, ease: 'linear' }}
+                style={{ display: 'inline-flex', color: 'var(--brand-300)' }}
+              >
+                <Activity size={14} />
+              </motion.span>
             )}
-          </div>
+          </span>
+        </CardTitle>
 
-          <motion.span
-            className="status-badge"
-            style={{ alignSelf: 'flex-start' }}
-            animate={{
-              backgroundColor: isGenerating ? 'rgba(124, 58, 237, 0.25)' : 'rgba(255, 255, 255, 0.05)',
-              borderColor: isGenerating ? 'rgba(124, 58, 237, 0.5)' : 'rgba(255, 255, 255, 0.1)',
-              color: isGenerating ? '#fff' : 'var(--text-muted)'
-            }}
-            transition={{ duration: 0.3 }}
-          >
-            {currentStage || "Idle"} <span style={{ opacity: 0.7, marginLeft: '6px' }}>{progress}%</span>
-          </motion.span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+          {elapsed && (
+            <Badge variant="ghost" size="sm">
+              <span className="tabular-nums">{elapsed}</span>
+            </Badge>
+          )}
+          <Badge variant={isGenerating ? 'brand' : 'ghost'} size="sm" dot pulse={isGenerating}>
+            {progress}%
+          </Badge>
         </div>
+      </CardHeader>
 
-        {/* LED Screen Avatar container */}
-        <div style={{ paddingLeft: '1rem' }}>
-          <ActiveAgentAvatar currentStage={currentStage} />
-        </div>
-      </div>
-
-      <div className="progress-bar-container">
+      {/* Progress hairline */}
+      <div
+        style={{
+          position: 'relative',
+          height: 3,
+          background: 'rgba(255, 255, 255, 0.05)',
+          overflow: 'hidden',
+        }}
+      >
         <motion.div
-          className="progress-bar"
-          initial={{ width: 0 }}
-          animate={{ width: `${progress}%` }}
-          transition={{ type: "spring", stiffness: 60, damping: 15 }}
+          animate={{ width: `${Math.max(0, Math.min(100, progress))}%` }}
+          transition={{ type: 'spring', stiffness: 80, damping: 20 }}
+          style={{
+            height: '100%',
+            background: 'var(--brand-gradient)',
+            backgroundSize: '200% 100%',
+            animation: isGenerating ? 'bg-pan 4s linear infinite' : 'none',
+            boxShadow: '0 0 12px var(--brand-glow)',
+          }}
         />
       </div>
 
-      <div className="log-container" ref={containerRef}>
-        {logs.length === 0 ? (
-          <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>Awaiting pipeline activation...</span>
-        ) : (
-          <AnimatePresence initial={false}>
-            {logs.map((log, i) => (
-              <motion.div
-                key={i}
-                initial={{ opacity: 0, x: -10, filter: 'blur(5px)' }}
-                animate={{ opacity: 1, x: 0, filter: 'blur(0px)' }}
-                transition={{ duration: 0.3 }}
-                style={{
-                  marginBottom: '0.4rem',
-                  padding: '0.2rem 0',
-                  borderBottom: '1px solid rgba(255,255,255,0.02)'
-                }}
-              >
-                {log}
-              </motion.div>
-            ))}
-          </AnimatePresence>
-        )}
-        <div ref={logEndRef} style={{ height: '1px' }} />
+      {/* Stage timeline body */}
+      <div style={{ padding: 'var(--space-5) var(--space-6)' }}>
+        <StageTimeline stages={stages} />
       </div>
 
+      {/* Error banner */}
       <AnimatePresence>
         {lastError && !isGenerating && (
           <motion.div
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
-            style={{ marginTop: '1.25rem', padding: '1rem', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}
+            transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+            style={{ overflow: 'hidden' }}
           >
-            <span style={{ color: '#FCA5A5', fontSize: '0.9rem', fontWeight: 500 }}>System Error: Generation halted</span>
-            <button className="btn btn-secondary" style={{ fontSize: '0.85rem', padding: '0.4rem 1.2rem', borderColor: '#FCA5A5', color: '#FCA5A5' }} onClick={onRetry}>
-              Retry Payload
-            </button>
+            <div
+              style={{
+                margin: 'var(--space-3) var(--space-6) var(--space-6)',
+                padding: 'var(--space-4)',
+                background: 'var(--danger-bg)',
+                border: '1px solid var(--danger-border)',
+                borderRadius: 'var(--radius-md)',
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                gap: 'var(--space-4)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 'var(--space-3)', minWidth: 0 }}>
+                <span
+                  style={{
+                    flexShrink: 0,
+                    display: 'inline-flex',
+                    width: 28, height: 28,
+                    alignItems: 'center', justifyContent: 'center',
+                    borderRadius: 'var(--radius-sm)',
+                    background: 'rgba(248, 113, 113, 0.18)',
+                    color: 'var(--danger)',
+                    border: '1px solid var(--danger-border)',
+                  }}
+                >
+                  <AlertTriangle size={14} />
+                </span>
+                <div style={{ minWidth: 0 }}>
+                  <div
+                    style={{
+                      fontSize: 'var(--text-sm)',
+                      fontWeight: 600,
+                      color: 'var(--danger)',
+                      letterSpacing: 'var(--tracking-tight)',
+                    }}
+                  >
+                    Generation halted
+                  </div>
+                  <div
+                    style={{
+                      marginTop: 2,
+                      fontSize: 'var(--text-xs)',
+                      color: 'var(--text-secondary)',
+                      lineHeight: 'var(--leading-snug)',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
+                    {lastError}
+                  </div>
+                </div>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                iconLeft={<RefreshCw size={12} />}
+                onClick={onRetry}
+                style={{ flexShrink: 0 }}
+              >
+                Retry
+              </Button>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
-    </motion.div>
+    </Card>
   );
 }
