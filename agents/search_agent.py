@@ -13,7 +13,16 @@ from typing import Generator, Dict, Any, List
 from ddgs import DDGS
 
 from config import PipelineConfig
-from constants import SEARCH_MAX_RESULTS, SEARCH_MIN_RESULTS, SEARCH_RETRY_DELAYS
+from constants import (
+    SEARCH_MAX_RESULTS,
+    SEARCH_MIN_RESULTS,
+    SEARCH_RETRY_DELAYS,
+    SEARCH_MAX_PER_PUBLISHER,
+    SEARCH_RECENCY_BONUS_MONTHS,
+    SEARCH_RECENCY_PENALTY_YEARS,
+    REPUTABLE_DOMAINS,
+    LOW_QUALITY_DOMAINS,
+)
 from utils import get_logger
 import cache
 
@@ -95,6 +104,102 @@ def _extract_publisher(url: str) -> str:
         return host.lstrip("www.").split(".")[0].capitalize()
     except Exception:
         return "Unknown"
+
+
+def _host_of(url: str) -> str:
+    """Lower-cased host for domain matching."""
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _parse_date_year(date_str: str) -> int | None:
+    """Best-effort year extraction from messy date strings."""
+    if not date_str or date_str == "n.d.":
+        return None
+    import re
+    m = re.search(r"(19|20)\d{2}", date_str)
+    if m:
+        try:
+            y = int(m.group(0))
+            if 1990 <= y <= 2100:
+                return y
+        except Exception:
+            pass
+    return None
+
+
+def _score_source(src_dict: dict) -> float:
+    """
+    Score a candidate source in [0, ~2.0]. Higher = better.
+    Components:
+      base       1.0
+      reputation +0.4 reputable / -0.7 low-quality
+      recency    +0.3 within bonus_months / -0.4 older than penalty_years
+      snippet    -0.3 if <60 chars (likely thin)
+      title      -0.2 if obvious SEO ('best of', 'top 10') without specifics
+    """
+    score = 1.0
+    host = _host_of(src_dict.get("url", ""))
+
+    # Domain reputation
+    if host:
+        if any(d in host for d in REPUTABLE_DOMAINS):
+            score += 0.4
+        if any(d in host for d in LOW_QUALITY_DOMAINS):
+            score -= 0.7
+
+    # Recency
+    from datetime import datetime
+    year = _parse_date_year(src_dict.get("date", ""))
+    if year:
+        now_year = datetime.now().year
+        age_months = (now_year - year) * 12
+        if age_months <= SEARCH_RECENCY_BONUS_MONTHS:
+            score += 0.3
+        elif (now_year - year) >= SEARCH_RECENCY_PENALTY_YEARS:
+            score -= 0.4
+
+    # Snippet quality
+    snippet = (src_dict.get("snippet") or "").strip()
+    if len(snippet) < 60:
+        score -= 0.3
+
+    # SEO-spam title heuristic
+    title = (src_dict.get("title") or "").lower()
+    if any(p in title for p in ("top 10", "top 5", "best of", "click here", "you won't believe")):
+        score -= 0.2
+
+    return score
+
+
+def _rank_and_diversify(sources: list[dict], max_per_publisher: int = SEARCH_MAX_PER_PUBLISHER) -> list[dict]:
+    """
+    Score every candidate, sort high → low, then enforce per-publisher cap.
+    Re-indexes the returned list so [SRC-N] numbering stays contiguous.
+    """
+    scored = []
+    for s in sources:
+        score = _score_source(s)
+        scored.append((score, s))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    per_pub_count: dict[str, int] = {}
+    kept: list[dict] = []
+    for score, src in scored:
+        pub = src.get("publisher", "Unknown")
+        if per_pub_count.get(pub, 0) >= max_per_publisher:
+            continue
+        per_pub_count[pub] = per_pub_count.get(pub, 0) + 1
+        src["quality_score"] = round(score, 2)
+        kept.append(src)
+
+    # Re-index for stable [SRC-N] numbering downstream
+    for i, src in enumerate(kept, 1):
+        src["index"] = i
+    return kept
 
 def _search_with_retry(query: str, max_results: int, skip_cache: bool) -> list[dict]:
     """Search with exponential backoff on rate-limit errors."""
@@ -186,10 +291,22 @@ async def run_search_node(state: dict) -> dict:
     if len(sources) < min_results:
         logger.warning("Only %d sources found (minimum %d)", len(sources), min_results)
 
+    # Quality scoring + publisher diversity cap
+    before = len(sources)
+    ranked = _rank_and_diversify(sources)
+    logger.info(
+        "Source quality filter: kept %d/%d after scoring + publisher cap (max %d/publisher)",
+        len(ranked), before, SEARCH_MAX_PER_PUBLISHER,
+    )
+    if ranked:
+        top = ranked[0]
+        logger.info("Top source: %s (score=%.2f, %s)",
+                    top.get("publisher"), top.get("quality_score", 0), top.get("title", "")[:80])
+
     return {
-        "current_status": f"Search Complete. Found {len(sources)} sources.",
+        "current_status": f"Search Complete. {len(ranked)} ranked sources.",
         "search_queries": queries,
-        "sources": sources,
+        "sources": ranked,
     }
 
 
