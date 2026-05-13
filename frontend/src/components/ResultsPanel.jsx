@@ -1,47 +1,306 @@
+import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { motion, AnimatePresence } from 'framer-motion';
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+import { Play, Film, RotateCcw, Download, AlertCircle, BookOpen, Headphones } from 'lucide-react';
+
 import AudioPlayer from './AudioPlayer';
 import ScriptViewer from './ScriptViewer';
 import SourcesList from './SourcesList';
+import Card, { CardHeader, CardTitle } from './ui/Card';
+import Button from './ui/Button';
+import Badge from './ui/Badge';
+
+export function VideoSection({ results }) {
+  const initialUrl = results?.video_url || null;
+  const [status, setStatus] = useState(initialUrl ? 'done' : 'idle'); // idle | generating | done | error
+  const [progress, setProgress] = useState(0);
+  const [progressMsg, setProgressMsg] = useState('');
+  const [videoUrl, setVideoUrl] = useState(initialUrl);
+  const [errorMsg, setErrorMsg] = useState('');
+
+  if (!results?.audio_url) return null;
+
+  const handleGenerate = async () => {
+    setStatus('generating');
+    setProgress(0);
+    setProgressMsg('Starting…');
+    setVideoUrl(null);
+    setErrorMsg('');
+
+    try {
+      await fetchEventSource('/api/generate-video', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audio_url: results.audio_url,
+          srt_url: results.srt_url || '',
+          title: results.metadata?.episode_title || 'Podcast Episode',
+        }),
+        openWhenHidden: true,
+        onmessage(ev) {
+          try {
+            const data = JSON.parse(ev.data);
+            if (data.pct !== undefined) setProgress(data.pct);
+            if (data.msg) setProgressMsg(data.msg);
+            if (data.done) {
+              if (data.video_url) { setVideoUrl(data.video_url); setStatus('done'); }
+              else { setErrorMsg(data.error || 'Video generation failed'); setStatus('error'); }
+            }
+          } catch (_) {}
+        },
+        onerror(err) {
+          setErrorMsg('Connection error during video generation');
+          setStatus('error');
+          throw err;
+        },
+      });
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setErrorMsg(err.message || 'Unknown error');
+        setStatus('error');
+      }
+    }
+  };
+
+  return (
+    <section style={{ marginTop: 'var(--space-6)' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 'var(--space-3)',
+          marginBottom: 'var(--space-3)',
+        }}
+      >
+        <span
+          style={{
+            display: 'inline-flex',
+            width: 24, height: 24,
+            alignItems: 'center', justifyContent: 'center',
+            borderRadius: 'var(--radius-xs)',
+            background: 'rgba(124, 92, 255, 0.12)',
+            color: 'var(--brand-300)',
+          }}
+        >
+          <Film size={13} />
+        </span>
+        <h3 style={{ margin: 0, fontSize: 'var(--text-md)', fontWeight: 600 }}>YouTube video</h3>
+        <Badge variant="ghost" size="xs">1080p</Badge>
+      </div>
+
+      {status === 'idle' && (
+        <div
+          style={{
+            padding: 'var(--space-5)',
+            background: 'rgba(0, 0, 0, 0.25)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-md)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 'var(--space-4)',
+            flexWrap: 'wrap',
+          }}
+        >
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+            <span style={{ fontSize: 'var(--text-sm)', fontWeight: 600, color: 'var(--text-primary)' }}>
+              Render the episode as a 1080p MP4
+            </span>
+            <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
+              Burns subtitles & generates a waveform visualisation. May take several minutes.
+            </span>
+          </div>
+          <Button variant="primary" size="md" iconLeft={<Play size={13} fill="currentColor" />} onClick={handleGenerate}>
+            Generate video
+          </Button>
+        </div>
+      )}
+
+      {status === 'generating' && (
+        <div
+          style={{
+            padding: 'var(--space-5)',
+            background: 'rgba(0, 0, 0, 0.25)',
+            border: '1px solid var(--border-subtle)',
+            borderRadius: 'var(--radius-md)',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              marginBottom: 'var(--space-2)',
+              fontSize: 'var(--text-xs)',
+              color: 'var(--text-secondary)',
+            }}
+          >
+            <span>{progressMsg}</span>
+            <span className="tabular-nums" style={{ color: 'var(--brand-300)', fontWeight: 600 }}>
+              {progress}%
+            </span>
+          </div>
+          <div
+            style={{
+              height: 4,
+              borderRadius: 'var(--radius-pill)',
+              background: 'rgba(255, 255, 255, 0.06)',
+              overflow: 'hidden',
+            }}
+          >
+            <motion.div
+              animate={{ width: `${progress}%` }}
+              transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+              style={{
+                height: '100%',
+                background: 'var(--brand-gradient)',
+                backgroundSize: '200% 100%',
+                animation: 'bg-pan 4s linear infinite',
+                boxShadow: '0 0 12px var(--brand-glow)',
+              }}
+            />
+          </div>
+          <p
+            style={{
+              marginTop: 'var(--space-3)',
+              fontSize: 'var(--text-2xs)',
+              color: 'var(--text-tertiary)',
+            }}
+          >
+            This may take several minutes depending on episode length…
+          </p>
+        </div>
+      )}
+
+      {status === 'done' && videoUrl && (
+        <div>
+          <video
+            src={videoUrl}
+            controls
+            style={{
+              width: '100%',
+              borderRadius: 'var(--radius-md)',
+              border: '1px solid var(--border-default)',
+              marginBottom: 'var(--space-3)',
+            }}
+          />
+          <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+            <Button
+              variant="primary"
+              size="md"
+              iconLeft={<Download size={13} />}
+              onClick={() => window.open(videoUrl, '_blank')}
+            >
+              Download MP4
+            </Button>
+            <Button
+              variant="secondary"
+              size="md"
+              iconLeft={<RotateCcw size={13} />}
+              onClick={() => { setStatus('idle'); setVideoUrl(null); }}
+            >
+              Regenerate
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {status === 'error' && (
+        <div
+          style={{
+            padding: 'var(--space-4)',
+            background: 'var(--danger-bg)',
+            border: '1px solid var(--danger-border)',
+            borderRadius: 'var(--radius-md)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 'var(--space-3)',
+            flexWrap: 'wrap',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)' }}>
+            <AlertCircle size={16} color="var(--danger)" />
+            <span style={{ fontSize: 'var(--text-sm)', color: 'var(--danger)', fontWeight: 500 }}>
+              {errorMsg}
+            </span>
+          </div>
+          <Button variant="secondary" size="sm" onClick={() => setStatus('idle')}>
+            Try again
+          </Button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SectionHeading({ icon, title, accent }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-3)', marginBottom: 'var(--space-3)' }}>
+      <span
+        style={{
+          display: 'inline-flex',
+          width: 24, height: 24,
+          alignItems: 'center', justifyContent: 'center',
+          borderRadius: 'var(--radius-xs)',
+          background: accent === 'cyan' ? 'rgba(77, 208, 225, 0.12)' : 'rgba(124, 92, 255, 0.12)',
+          color: accent === 'cyan' ? 'var(--accent-cyan)' : 'var(--brand-300)',
+        }}
+      >
+        {icon}
+      </span>
+      <h3 style={{ margin: 0, fontSize: 'var(--text-md)', fontWeight: 600 }}>{title}</h3>
+    </div>
+  );
+}
 
 export default function ResultsPanel({ results, script, sources }) {
   const hasContent = results || script.length > 0 || sources.length > 0;
   if (!hasContent) return null;
 
   return (
-    <motion.div
-      className="glass-panel"
-      style={{ padding: 0, overflow: 'hidden' }}
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      exit={{ opacity: 0, scale: 0.95 }}
-    >
-      <div style={{ padding: '1.5rem', borderBottom: '1px solid var(--border)', background: 'rgba(255,255,255,0.02)' }}>
-        <h2 style={{ margin: 0, fontSize: '1.4rem', fontWeight: 600 }}>Results</h2>
-      </div>
+    <Card padding="none">
+      <CardHeader>
+        <CardTitle eyebrow="Output">Results</CardTitle>
+        <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+          {results?.audio_url && <Badge variant="success" size="sm" icon={<Headphones size={11} />}>Audio ready</Badge>}
+          {results?.show_notes && <Badge variant="info" size="sm" icon={<BookOpen size={11} />}>Show notes</Badge>}
+          {sources?.length > 0 && <Badge variant="ghost" size="sm">{sources.length} sources</Badge>}
+        </div>
+      </CardHeader>
 
-      <div style={{ padding: '1.5rem' }}>
+      <div style={{ padding: 'var(--space-6)' }}>
         <AnimatePresence>
           {results && (
             <motion.div
-              initial={{ opacity: 0, y: 10 }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.1 }}
+              transition={{ delay: 0.08 }}
             >
               <AudioPlayer results={results} />
             </motion.div>
           )}
 
+          {results?.audio_url && <VideoSection results={results} />}
+
           {results?.show_notes && (
             <motion.div
-              style={{ marginBottom: '2rem' }}
-              className="markdown-content"
-              initial={{ opacity: 0, y: 10 }}
+              style={{ marginTop: 'var(--space-7)' }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.2 }}
+              transition={{ delay: 0.18 }}
             >
-              <h3 style={{ color: 'var(--accent)' }}>Show Notes</h3>
-              <div style={{ background: 'rgba(0,0,0,0.3)', padding: '1.5rem', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)', boxShadow: 'inset 0 2px 10px rgba(0,0,0,0.2)' }}>
+              <SectionHeading icon={<BookOpen size={13} />} title="Show notes" />
+              <div
+                className="markdown-content"
+                style={{
+                  background: 'rgba(0, 0, 0, 0.25)',
+                  padding: 'var(--space-5) var(--space-6)',
+                  borderRadius: 'var(--radius-md)',
+                  border: '1px solid var(--border-subtle)',
+                  boxShadow: 'inset 0 1px 8px rgba(0, 0, 0, 0.2)',
+                }}
+              >
                 <ReactMarkdown>{results.show_notes}</ReactMarkdown>
               </div>
             </motion.div>
@@ -49,9 +308,10 @@ export default function ResultsPanel({ results, script, sources }) {
 
           {script && script.length > 0 && (
             <motion.div
-              initial={{ opacity: 0, y: 10 }}
+              style={{ marginTop: 'var(--space-7)' }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.3 }}
+              transition={{ delay: 0.26 }}
             >
               <ScriptViewer script={script} />
             </motion.div>
@@ -59,15 +319,16 @@ export default function ResultsPanel({ results, script, sources }) {
 
           {sources && sources.length > 0 && (
             <motion.div
-              initial={{ opacity: 0, y: 10 }}
+              style={{ marginTop: 'var(--space-7)' }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.4 }}
+              transition={{ delay: 0.34 }}
             >
               <SourcesList sources={sources} />
             </motion.div>
           )}
         </AnimatePresence>
       </div>
-    </motion.div>
+    </Card>
   );
 }
