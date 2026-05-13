@@ -353,6 +353,12 @@ class _KokoroBackend:
             return np.zeros(100, dtype="float32"), cls.SAMPLE_RATE
         return np.concatenate(chunks_out), cls.SAMPLE_RATE
 
+    @classmethod
+    def unload(cls) -> None:
+        cls._pipe = None
+        cls._loaded = False
+        _gpu_cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Backend: Bark
@@ -424,6 +430,13 @@ class _BarkBackend:
             speech = cls._model.generate(**inputs, do_sample=True)
         audio = speech.cpu().numpy().squeeze().astype("float32")
         return _normalise(audio), cls.SAMPLE_RATE
+
+    @classmethod
+    def unload(cls) -> None:
+        cls._model = None
+        cls._processor = None
+        cls._loaded = False
+        _gpu_cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +537,12 @@ class _QwenBackend:
             )
         return _normalise(wavs[0]), sr
 
+    @classmethod
+    def unload(cls) -> None:
+        cls._model = None
+        cls._loaded = False
+        _gpu_cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Backend: Chatterbox
@@ -605,6 +624,15 @@ class _ChatterboxBackend:
         arr = wav.squeeze().cpu().numpy().astype("float32")
         return _normalise(arr), cls.SAMPLE_RATE
 
+    @classmethod
+    def unload(cls) -> None:
+        # Chatterbox stays resident on CUDA after synthesis; explicit drop +
+        # cache empty is required before another CUDA model (Whisper) loads
+        # or it can silently stall inside CTranslate2's decode loop on Windows.
+        cls._model = None
+        cls._loaded = False
+        _gpu_cleanup()
+
 
 # ---------------------------------------------------------------------------
 # Backend registry
@@ -616,6 +644,30 @@ _BACKENDS = {
     "qwen": _QwenBackend,
     "chatterbox": _ChatterboxBackend,
 }
+
+
+def unload_all_backends() -> None:
+    """Free every loaded TTS backend's model and clear CUDA cache.
+
+    Call this between heavy GPU stages (e.g. before Whisper alignment) so that
+    a TTS model still resident on the GPU doesn't starve the next consumer.
+    Backends are reloadable on the next synthesise() call via load().
+    """
+    for name, cls in _BACKENDS.items():
+        try:
+            if getattr(cls, "_loaded", False):
+                cls.unload()
+                logger.info("[TTS] Unloaded backend '%s'.", name)
+        except Exception as exc:
+            logger.warning("[TTS] Failed to unload backend '%s': %s", name, exc)
+    # Final sweep — also releases anything dangling from voice consistency check, etc.
+    _gpu_cleanup()
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------

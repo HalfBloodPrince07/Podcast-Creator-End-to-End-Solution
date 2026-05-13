@@ -54,7 +54,12 @@ _CUE_RE = re.compile(r'\[CUE:\s*(\w+)\]', re.IGNORECASE)
 # ---------------------------------------------------------------------------
 
 def _resolve_whisper_device() -> tuple[str, str]:
-    """Return (device, compute_type) — auto-detect CUDA if WHISPER_DEVICE=='auto'."""
+    """Return (device, compute_type) — auto-detect CUDA if WHISPER_DEVICE=='auto'.
+
+    Note: TTS backends are unloaded from the GPU before this runs (see
+    `unload_all_backends`), otherwise Chatterbox staying resident on CUDA
+    would silently stall faster-whisper's decode loop right after VAD on Windows.
+    """
     device = WHISPER_DEVICE
     compute = WHISPER_COMPUTE_TYPE
     if device == "auto":
@@ -477,6 +482,15 @@ def _run_post_production_sync(state: dict) -> dict:
     output_dir = audio_in.parent
 
     # Step A — Whisper alignment
+    # Free TTS models from GPU first so Whisper doesn't have to fight them
+    # for VRAM (a resident Chatterbox model can stall faster-whisper's decode
+    # loop indefinitely on Windows + cuDNN).
+    try:
+        from agents.tts_agent import unload_all_backends
+        unload_all_backends()
+    except Exception as exc:
+        logger.warning("Could not unload TTS backends before Whisper: %s", exc)
+
     logger.info("[1/3] Running Whisper alignment...")
     words = _run_whisper_alignment(str(audio_in))
     if not words:
