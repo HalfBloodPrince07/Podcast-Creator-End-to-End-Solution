@@ -54,6 +54,59 @@ _VISUAL_RE = re.compile(r'\[VISUAL:\s*([^\]]+)\]', re.IGNORECASE)
 # Step A: Whisper alignment
 # ---------------------------------------------------------------------------
 
+_cuda_dll_dirs_registered = False
+
+
+def _register_pip_cuda_dll_dirs() -> None:
+    """Make Windows aware of cuBLAS / cuDNN DLLs installed via pip.
+
+    Installing `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` puts the DLLs at
+    site-packages/nvidia/cublas/bin and site-packages/nvidia/cudnn/bin, but
+    Windows DLL resolution doesn't search those automatically. We register
+    them TWO ways because Python's `os.add_dll_directory()` only affects the
+    Python loader — ctranslate2's C++ extension loads cuBLAS lazily via
+    raw `LoadLibrary` at GPU encode time, which only searches PATH. Without
+    the PATH prepend you get "Library cublas64_12.dll is not found" the
+    moment a real transcribe happens (model load itself succeeds — the
+    failure is deferred to first encode).
+
+    No-op on non-Windows or if the packages aren't installed.
+    """
+    global _cuda_dll_dirs_registered
+    if _cuda_dll_dirs_registered:
+        return
+    _cuda_dll_dirs_registered = True
+
+    import os, sys, importlib.util
+    if sys.platform != "win32":
+        return
+
+    bin_dirs: list[str] = []
+    for pkg in ("nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_runtime", "nvidia.cuda_nvrtc"):
+        try:
+            spec = importlib.util.find_spec(pkg)
+        except Exception:
+            spec = None
+        if not spec or not spec.submodule_search_locations:
+            continue
+        for base in spec.submodule_search_locations:
+            bin_dir = Path(base) / "bin"
+            if bin_dir.is_dir():
+                bin_dirs.append(str(bin_dir))
+
+    for bin_dir in bin_dirs:
+        if hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(bin_dir)
+            except (OSError, FileNotFoundError) as exc:
+                logger.debug("add_dll_directory(%s) failed: %s", bin_dir, exc)
+        # Prepend to PATH so ctranslate2's runtime LoadLibrary can find them.
+        current_path = os.environ.get("PATH", "")
+        if bin_dir not in current_path.split(os.pathsep):
+            os.environ["PATH"] = bin_dir + os.pathsep + current_path
+        logger.info("Registered CUDA DLL dir: %s", bin_dir)
+
+
 def _resolve_whisper_device() -> tuple[str, str]:
     """Return (device, compute_type) — auto-detect CUDA if WHISPER_DEVICE=='auto'.
 
@@ -75,7 +128,15 @@ def _resolve_whisper_device() -> tuple[str, str]:
 
 
 def _run_whisper_alignment(audio_path: str) -> list[dict]:
-    """Transcribe audio with word-level timestamps. Returns [] on failure."""
+    """Transcribe audio with word-level timestamps. Returns [] on total failure.
+
+    Tries the configured device first; if that fails for a CUDA-library reason
+    (e.g. ctranslate2 can't find cublas64_12.dll), retries on CPU/int8 so the
+    rest of the pipeline still gets word timings — slower, but the beat
+    director downstream NEEDS this data and a silent skip means the visual
+    bed loses its only ground truth.
+    """
+    _register_pip_cuda_dll_dirs()
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -83,40 +144,66 @@ def _run_whisper_alignment(audio_path: str) -> list[dict]:
         return []
 
     device, compute = _resolve_whisper_device()
-    logger.info("Whisper: loading %s on %s (%s)...", WHISPER_MODEL, device, compute)
-    try:
-        model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
-        seg_iter, info = model.transcribe(
-            audio_path,
-            word_timestamps=True,
-            language="en",
-            beam_size=WHISPER_BEAM_SIZE,
-            vad_filter=True,
-        )
-        words: list[dict] = []
-        for seg in seg_iter:
-            if not seg.words:
-                continue
-            for w in seg.words:
-                if w.word is None or w.start is None or w.end is None:
-                    continue
-                words.append({
-                    "word": w.word,
-                    "start": float(w.start),
-                    "end": float(w.end),
-                })
-        logger.info("Whisper: aligned %d words (audio %.1fs)", len(words), info.duration)
-        # Release Whisper's GPU/CPU resources before subsequent steps
+    attempts = [(device, compute)]
+    if device == "cuda":
+        # CPU fallback. int8 is plenty for word-timestamp alignment.
+        attempts.append(("cpu", "int8"))
+
+    last_exc: Optional[Exception] = None
+    for attempt_device, attempt_compute in attempts:
+        logger.info("Whisper: loading %s on %s (%s)...", WHISPER_MODEL, attempt_device, attempt_compute)
         try:
-            del model
-        except Exception:
-            pass
-        _gpu_cleanup()
-        return words
-    except Exception as exc:
-        logger.warning("Whisper alignment failed: %s — continuing without it.", exc)
-        _gpu_cleanup()
-        return []
+            model = WhisperModel(WHISPER_MODEL, device=attempt_device, compute_type=attempt_compute)
+            seg_iter, info = model.transcribe(
+                audio_path,
+                word_timestamps=True,
+                language="en",
+                beam_size=WHISPER_BEAM_SIZE,
+                vad_filter=True,
+            )
+            words: list[dict] = []
+            for seg in seg_iter:
+                if not seg.words:
+                    continue
+                for w in seg.words:
+                    if w.word is None or w.start is None or w.end is None:
+                        continue
+                    words.append({
+                        "word": w.word,
+                        "start": float(w.start),
+                        "end": float(w.end),
+                    })
+            logger.info(
+                "Whisper: aligned %d words (audio %.1fs) on %s/%s.",
+                len(words), info.duration, attempt_device, attempt_compute,
+            )
+            try:
+                del model
+            except Exception:
+                pass
+            _gpu_cleanup()
+            return words
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc)
+            cuda_lib_miss = any(
+                tok in msg for tok in ("cublas64", "cudnn", "cublasLt", "CUDA driver", "CUDNN")
+            )
+            if attempt_device == "cuda" and (cuda_lib_miss or "cuda" in msg.lower()):
+                logger.warning(
+                    "Whisper CUDA load failed (%s) — retrying on CPU. To restore "
+                    "GPU speed, run: pip install nvidia-cublas-cu12 nvidia-cudnn-cu12",
+                    exc,
+                )
+                _gpu_cleanup()
+                continue
+            logger.warning("Whisper alignment failed on %s/%s: %s", attempt_device, attempt_compute, exc)
+            _gpu_cleanup()
+            break
+
+    if last_exc is not None:
+        logger.warning("Whisper alignment unavailable — continuing without word timings.")
+    return []
 
 
 def _gpu_cleanup() -> None:
