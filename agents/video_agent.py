@@ -470,6 +470,8 @@ def generate_podcast_video(
     progress: Optional[Callable[[str, int], None]] = None,
     use_visual_bed: bool = True,
     script_segments: Optional[list[dict]] = None,
+    prebuilt_bed_path: Optional[Path] = None,
+    use_cogvideox: bool = False,
 ) -> Optional[str]:
     """
     Generate a 1080p podcast video. Returns the output MP4 path or None on failure.
@@ -478,6 +480,10 @@ def generate_podcast_video(
       1. (Optional) Build an AI-generated visual bed from [VISUAL:] cues +
          Whisper timings if visual_cues.json is present alongside the audio.
          Falls back to the styled background PNG otherwise.
+         If `prebuilt_bed_path` is provided, the build step is SKIPPED — the
+         caller (e.g. the cue re-roll endpoint) has already stitched the bed
+         and we just need to composite it. The prebuilt bed is also preserved
+         on disk afterwards so subsequent re-rolls can re-stitch from it.
       2. FFmpeg: bed (or background) + audio -> MP4 with animated waveform
       3. FFmpeg: burn subtitles from SRT
     """
@@ -494,7 +500,13 @@ def generate_podcast_video(
 
     # ── Step 1: visual bed (preferred) or styled background fallback ──────────
     visual_bed_path: Optional[Path] = None
-    if use_visual_bed and (output_dir / "visual_cues.json").exists():
+    bed_was_prebuilt = False
+    if prebuilt_bed_path is not None and Path(prebuilt_bed_path).exists():
+        visual_bed_path = Path(prebuilt_bed_path)
+        bed_was_prebuilt = True
+        if progress:
+            progress("Using prebuilt visual bed...", 15)
+    elif use_visual_bed and (output_dir / "visual_cues.json").exists():
         if progress:
             progress("Building AI visual bed...", 5)
         try:
@@ -504,6 +516,7 @@ def generate_podcast_video(
                 output_dir=output_dir,
                 script_segments=script_segments,
                 progress=progress,
+                use_cogvideox=use_cogvideox,
             )
         except Exception as exc:
             logger.warning("Visual bed build crashed (%s) — falling back to static background.", exc)
@@ -545,9 +558,10 @@ def generate_podcast_video(
         _move(raw_path, final_path)
 
     _cleanup(bg_path)
-    if visual_bed_path is not None:
+    if visual_bed_path is not None and not bed_was_prebuilt:
         # The stitched bed is large (~50 MB+); per-interval PNG cache lives
-        # under _visual_images/ for Phase 4 re-rolls.
+        # under _visual_images/ for Phase 4 re-rolls. Keep a prebuilt bed
+        # passed in by the caller — they need it for subsequent re-rolls.
         _cleanup(visual_bed_path)
 
     if progress:

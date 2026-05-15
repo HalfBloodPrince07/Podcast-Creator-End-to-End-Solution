@@ -14,7 +14,7 @@ function formatTimestamp(ms) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-export default function VisualCuesPanel({ runId }) {
+export default function VisualCuesPanel({ runId, onVideoUpdated }) {
   const [cues, setCues] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -106,14 +106,20 @@ export default function VisualCuesPanel({ runId }) {
         }}
       >
         {cues.map((cue) => (
-          <CueCard key={cue.cue_index} cue={cue} runId={runId} onUpdated={load} />
+          <CueCard
+            key={cue.cue_index}
+            cue={cue}
+            runId={runId}
+            onUpdated={load}
+            onVideoUpdated={onVideoUpdated}
+          />
         ))}
       </div>
     </section>
   );
 }
 
-function CueCard({ cue, runId, onUpdated }) {
+function CueCard({ cue, runId, onUpdated, onVideoUpdated }) {
   const [editing, setEditing] = useState(false);
   const [draftPrompt, setDraftPrompt] = useState(cue.prompt || '');
   const [useCog, setUseCog] = useState(true);
@@ -160,6 +166,10 @@ function CueCard({ cue, runId, onUpdated }) {
                 setStatus('idle');
                 setEditing(false);
                 onUpdated?.();
+                // If the server also recomposited episode.mp4 (re-roll
+                // auto-composite), notify the parent so the video player
+                // refetches the new file instead of serving its cache.
+                if (data.episode_url) onVideoUpdated?.();
               }
             }
           } catch (_) {}

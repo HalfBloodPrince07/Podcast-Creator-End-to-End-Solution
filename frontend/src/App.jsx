@@ -37,9 +37,13 @@ function App() {
   // Sticky across this page lifetime — controls whether the video step
   // auto-fires after audio finishes. Reset on each new generation start.
   const [autoVideo, setAutoVideo] = useState(false);
+  // "slideshow" (SDXL stills + Ken-Burns) or "ai_clips" (CogVideoX, ~10-15min/cue).
+  // Drives /api/generate-video for both auto-fire and manual click paths.
+  const [videoMode, setVideoMode] = useState('slideshow');
 
   const handleGenerate = (formData) => {
     setAutoVideo(!!formData.auto_video);
+    setVideoMode(formData.video_mode || 'slideshow');
     gen.generate({
       ...formData,
       llm_url: settings.llmUrl,
@@ -142,6 +146,7 @@ function App() {
                         script={gen.script}
                         sources={gen.sources}
                         autoVideo={autoVideo}
+                        videoMode={videoMode}
                       />
                     </motion.div>
                   )}

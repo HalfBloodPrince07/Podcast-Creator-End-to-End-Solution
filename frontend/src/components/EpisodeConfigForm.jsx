@@ -33,6 +33,9 @@ export default function EpisodeConfigForm({ isGenerating, onGenerate, onStop }) 
   const [dryRun, setDryRun] = useState(false);
   const [pauseForReview, setPauseForReview] = useState(false);
   const [autoVideo, setAutoVideo] = useState(false);
+  // Two modes: "slideshow" (default — SDXL stills + Ken-Burns, fast) or
+  // "ai_clips" (CogVideoX t2v on each cue interval, ~10-15 min per cue).
+  const [videoMode, setVideoMode] = useState('slideshow');
   const [ttsBackend, setTtsBackend] = useState('kokoro');
   const [voiceGender, setVoiceGender] = useState('female');
   const [voiceId, setVoiceId] = useState('');
@@ -56,6 +59,7 @@ export default function EpisodeConfigForm({ isGenerating, onGenerate, onStop }) 
       dry_run: dryRun,
       pause_for_review: pauseForReview,
       auto_video: autoVideo,
+      video_mode: videoMode,
       multi_voice: false,
       tts_backend: ttsBackend,
       voice_gender: voiceGender,
@@ -276,6 +280,81 @@ export default function EpisodeConfigForm({ isGenerating, onGenerate, onStop }) 
                 label="Auto-generate video"
                 description="Render the 1080p video (AI visual bed + waveform + subtitles) right after audio finishes — no extra click."
               />
+
+              {/* Video quality / speed tradeoff. Slideshow is the safe default
+                  because CogVideoX runs ~10-15 min per cue on a 5060 Ti — a
+                  30-min episode with 10 cues would take 2-3 hours just for
+                  the t2v clips. Users can still re-roll individual cues with
+                  CogVideoX from the cue panel after a slideshow build. */}
+              <div
+                style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 'var(--space-2)',
+                  padding: 'var(--space-3) var(--space-4)',
+                  border: '1px solid var(--border-subtle)',
+                  borderRadius: 'var(--radius-md)',
+                  background: 'rgba(0, 0, 0, 0.15)',
+                }}
+              >
+                <div style={{ fontSize: 'var(--text-sm)', fontWeight: 600 }}>
+                  Visual bed style
+                </div>
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 'var(--space-2)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="video_mode"
+                    value="slideshow"
+                    checked={videoMode === 'slideshow'}
+                    onChange={() => setVideoMode('slideshow')}
+                    style={{ marginTop: 3 }}
+                  />
+                  <div>
+                    <div style={{ fontSize: 'var(--text-sm)', fontWeight: 500 }}>
+                      AI image slideshow <span style={{ opacity: 0.6 }}>(recommended)</span>
+                    </div>
+                    <div style={{ fontSize: 'var(--text-xs)', opacity: 0.7, marginTop: 2 }}>
+                      SDXL stills + Ken-Burns motion on every interval. A 30-min episode
+                      finishes in a few minutes. Re-roll individual cues into video clips
+                      later from the visual cues panel.
+                    </div>
+                  </div>
+                </label>
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 'var(--space-2)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="video_mode"
+                    value="ai_clips"
+                    checked={videoMode === 'ai_clips'}
+                    onChange={() => setVideoMode('ai_clips')}
+                    style={{ marginTop: 3 }}
+                  />
+                  <div>
+                    <div style={{ fontSize: 'var(--text-sm)', fontWeight: 500 }}>
+                      AI video clips <span style={{ opacity: 0.6 }}>(very slow)</span>
+                    </div>
+                    <div style={{ fontSize: 'var(--text-xs)', opacity: 0.7, marginTop: 2 }}>
+                      Generates a CogVideoX-5B text-to-video clip for every cue interval.
+                      Quality is dramatic but takes ~10-15 min per cue on a 16 GB GPU —
+                      expect 2-3+ hours for a 30-min episode with ~10 cues.
+                    </div>
+                  </div>
+                </label>
+              </div>
             </div>
           </div>
         </Section>

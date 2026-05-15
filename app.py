@@ -50,6 +50,11 @@ def _preload_whisper() -> None:
     """Preload the faster-whisper model so the first episode doesn't pay the cold-start tax."""
     try:
         from constants import WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE
+        # Register pip-installed CUDA DLL search dirs (nvidia-cublas-cu12 /
+        # nvidia-cudnn-cu12) BEFORE importing faster_whisper, otherwise
+        # ctranslate2 can't find cublas64_12.dll on Windows.
+        from agents.post_production_agent import _register_pip_cuda_dll_dirs
+        _register_pip_cuda_dll_dirs()
         from faster_whisper import WhisperModel
         device = WHISPER_DEVICE
         compute = WHISPER_COMPUTE_TYPE
@@ -146,6 +151,10 @@ class VideoRequest(BaseModel):
     audio_url: str
     srt_url: str = ""
     title: str = "Podcast Episode"
+    # "slideshow" -> SDXL stills + Ken-Burns only (fast, ~minutes for a 30min episode)
+    # "ai_clips"  -> SDXL stills + CogVideoX-5B t2v clips on cue intervals
+    #                (slow, ~10-15 min per cue clip).
+    video_mode: str = "slideshow"
 
 
 class VisualRegenRequest(BaseModel):
@@ -736,6 +745,7 @@ async def generate_video(req: VideoRequest):
                     audio_path, srt_path, out_dir, req.title,
                     progress=progress_cb,
                     script_segments=script_segments,
+                    use_cogvideox=(req.video_mode == "ai_clips"),
                 )
                 q.put({"done": True, "video_path": video_path})
             except Exception as exc:
@@ -859,7 +869,7 @@ async def list_visual_cues(run_id: str):
         # earlier cue's match. The planner is deterministic, so we re-run it
         # cheaply here to get the exact interval index per cue.
         try:
-            from agents.visual_agent import _plan_intervals
+            from agents.visual_agent import _plan_intervals, _load_cached_beats
             # Read script_segments from metadata so gap-prompt derivation matches
             meta = json.loads((ep_dir / "metadata.json").read_text(encoding="utf-8"))
             script_segs = meta.get("segments") or []
@@ -870,7 +880,12 @@ async def list_visual_cues(run_id: str):
                 duration_ms = int((ww[-1]["end"] if ww else 0) * 1000)
             else:
                 duration_ms = max((c.get("end_ms", 0) for c in cues), default=0)
-            intervals = _plan_intervals(cues, duration_ms, script_segs)
+            # Pass the cached beat schedule so the re-derived interval ordering
+            # matches the one used when the bed was originally built. Without
+            # this the gap intervals would be different and cue -> interval
+            # index lookups would point at the wrong PNG.
+            beats = _load_cached_beats(ep_dir)
+            intervals = _plan_intervals(cues, duration_ms, script_segments=script_segs, beat_schedule=beats)
             cue_iter = iter(range(len(cues)))
             for iv_idx, iv in enumerate(intervals):
                 if iv["kind"] != "cue":
@@ -935,14 +950,16 @@ async def regenerate_visual_cue(req: VisualRegenRequest):
                 from agents.visual_agent import (
                     _SDXLBackend, _CogVideoXBackend, _ken_burns_clip,
                     _stretch_clip_to_duration, _cog_cache_dir, _cog_cache_key,
-                    _plan_intervals, _concat_with_crossfade,
+                    _plan_intervals, _concat_with_crossfade, _load_cached_beats,
                 )
                 from constants import (
                     SDXL_WIDTH, SDXL_HEIGHT, VISUAL_STYLE_SUFFIX,
                 )
 
                 # Re-derive intervals so we know which interval index this cue
-                # maps to (the planner interleaves gap intervals).
+                # maps to (the planner interleaves gap intervals). MUST pass
+                # the cached beat schedule or the recovered interval order
+                # won't match the one used during the original build.
                 meta = json.loads((ep_dir / "metadata.json").read_text(encoding="utf-8"))
                 script_segs = meta.get("segments") or []
                 ww_path = ep_dir / "whisper_words.json"
@@ -951,7 +968,10 @@ async def regenerate_visual_cue(req: VisualRegenRequest):
                     duration_ms = int((ww[-1]["end"] if ww else 0) * 1000)
                 else:
                     duration_ms = max((c.get("end_ms", 0) for c in cues), default=0)
-                intervals = _plan_intervals(cues, duration_ms, script_segs)
+                beats = _load_cached_beats(ep_dir)
+                intervals = _plan_intervals(
+                    cues, duration_ms, script_segments=script_segs, beat_schedule=beats,
+                )
 
                 # Find the interval id for this cue (Nth 'cue' interval).
                 target_iv_idx = None
@@ -1045,14 +1065,51 @@ async def regenerate_visual_cue(req: VisualRegenRequest):
                     q.put({"done": True, "error": "Bed stitch failed"})
                     return
 
+                # ── Auto-composite the final episode.mp4 with the new bed ──
+                # Without this the user has to click "Generate Video" again
+                # for the re-rolled cue to show up in the downloaded video.
+                # We pass `prebuilt_bed_path` so generate_podcast_video skips
+                # build_visual_bed (which would clobber the new interval PNG)
+                # and goes straight to the composite + subtitle burn.
+                progress_cb("Recompositing final video...", 94)
+                from agents.video_agent import generate_podcast_video
+                audio_path = ep_dir / "episode.mp3"
+                srt_path = ep_dir / "transcript.srt"
+                title = "Podcast Episode"
+                try:
+                    meta = json.loads((ep_dir / "metadata.json").read_text(encoding="utf-8"))
+                    title = meta.get("episode_title") or meta.get("podcast_topic") or title
+                except Exception:
+                    pass
+
+                video_path: Optional[str] = None
+                if audio_path.exists():
+                    try:
+                        video_path = generate_podcast_video(
+                            str(audio_path),
+                            str(srt_path) if srt_path.exists() else "",
+                            ep_dir,
+                            title,
+                            progress=progress_cb,
+                            script_segments=meta.get("segments") if 'meta' in locals() else None,
+                            prebuilt_bed_path=bed_path,
+                        )
+                    except Exception as exc:
+                        logger.warning("Auto-recomposite failed (%s) — bed updated but episode.mp4 was not.", exc)
+                else:
+                    logger.warning("No episode.mp3 at %s — skipping auto-recomposite.", audio_path)
+
                 rel = ep_dir.relative_to(OUTPUTS_DIR).as_posix()
-                q.put({
+                payload = {
                     "done": True,
                     "thumbnail_url": f"/outputs/{rel}/_visual_images/interval_{target_iv_idx:03d}.png",
                     "bed_url": f"/outputs/{rel}/_visual_bed.mp4",
                     "interval_index": target_iv_idx,
                     "seed": seed,
-                })
+                }
+                if video_path:
+                    payload["episode_url"] = f"/outputs/{rel}/episode.mp4"
+                q.put(payload)
             except Exception as exc:
                 q.put({"done": True, "error": str(exc)})
 

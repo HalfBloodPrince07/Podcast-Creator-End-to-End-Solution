@@ -42,6 +42,9 @@ export default function EpisodeLibrary() {
   const [detail, setDetail] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
   const [regenState, setRegenState] = useState({ name: null, pct: 0, msg: '' });
+  // Bumped after a per-cue re-roll auto-recomposites episode.mp4, so the
+  // <video> tag refetches the updated file instead of using the cached one.
+  const [libraryVideoCacheBust, setLibraryVideoCacheBust] = useState(0);
   const [query, setQuery] = useState('');
   const [confirmDelete, setConfirmDelete] = useState(null); // runId
 
@@ -221,8 +224,12 @@ export default function EpisodeLibrary() {
                   video_url: fileMap.video_url || null,
                   metadata: { episode_title: detail.episode_title },
                 }}
+                cacheBust={libraryVideoCacheBust}
               />
-              <VisualCuesPanel runId={selected} />
+              <VisualCuesPanel
+                runId={selected}
+                onVideoUpdated={() => setLibraryVideoCacheBust((v) => v + 1)}
+              />
             </div>
           )}
 

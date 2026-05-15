@@ -12,7 +12,7 @@ import Card, { CardHeader, CardTitle } from './ui/Card';
 import Button from './ui/Button';
 import Badge from './ui/Badge';
 
-export function VideoSection({ results, autoVideo = false }) {
+export function VideoSection({ results, autoVideo = false, cacheBust = 0, videoMode = 'slideshow' }) {
   const initialUrl = results?.video_url || null;
   const [status, setStatus] = useState(initialUrl ? 'done' : 'idle'); // idle | generating | done | error
   const [progress, setProgress] = useState(0);
@@ -40,6 +40,7 @@ export function VideoSection({ results, autoVideo = false }) {
           audio_url: results.audio_url,
           srt_url: results.srt_url || '',
           title: results.metadata?.episode_title || 'Podcast Episode',
+          video_mode: videoMode,
         }),
         openWhenHidden: true,
         onmessage(ev) {
@@ -65,7 +66,7 @@ export function VideoSection({ results, autoVideo = false }) {
         setStatus('error');
       }
     }
-  }, [results?.audio_url, results?.srt_url, results?.metadata?.episode_title]);
+  }, [results?.audio_url, results?.srt_url, results?.metadata?.episode_title, videoMode]);
 
   // Reset the auto-fire guard whenever a fresh `results` payload arrives
   // (i.e. the user kicked off a new generation).
@@ -198,7 +199,8 @@ export function VideoSection({ results, autoVideo = false }) {
       {status === 'done' && videoUrl && (
         <div>
           <video
-            src={videoUrl}
+            key={cacheBust}
+            src={cacheBust > 0 ? `${videoUrl}?v=${cacheBust}` : videoUrl}
             controls
             style={{
               width: '100%',
@@ -277,8 +279,12 @@ function SectionHeading({ icon, title, accent }) {
   );
 }
 
-export default function ResultsPanel({ results, script, sources, autoVideo = false }) {
+export default function ResultsPanel({ results, script, sources, autoVideo = false, videoMode = 'slideshow' }) {
   const hasContent = results || script.length > 0 || sources.length > 0;
+  // Bumped whenever a per-cue re-roll auto-recomposites episode.mp4. The
+  // VideoSection appends this to the video src so the browser refetches
+  // the updated file instead of serving its cached copy.
+  const [videoCacheBust, setVideoCacheBust] = useState(0);
   if (!hasContent) return null;
 
   return (
@@ -304,8 +310,13 @@ export default function ResultsPanel({ results, script, sources, autoVideo = fal
             </motion.div>
           )}
 
-          {results?.audio_url && <VideoSection results={results} autoVideo={autoVideo} />}
-          {results?.metadata?.run_id && <VisualCuesPanel runId={results.metadata.run_id} />}
+          {results?.audio_url && <VideoSection results={results} autoVideo={autoVideo} cacheBust={videoCacheBust} videoMode={videoMode} />}
+          {results?.metadata?.run_id && (
+            <VisualCuesPanel
+              runId={results.metadata.run_id}
+              onVideoUpdated={() => setVideoCacheBust((v) => v + 1)}
+            />
+          )}
 
           {results?.show_notes && (
             <motion.div
