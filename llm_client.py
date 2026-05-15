@@ -61,7 +61,11 @@ class LMStudioClient:
         *,
         model: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 10000,
+        # Generous default — LM Studio supports up to 131072 total context
+        # on the user's Gemma-4-e4b setup, so a 32K floor gives any call
+        # site that forgot to specify max_tokens plenty of room without
+        # risking the empty-content-after-<think>-strip trap.
+        max_tokens: int = 32768,
         **kwargs: Any,
     ) -> str:
         """
@@ -76,9 +80,19 @@ class LMStudioClient:
             max_tokens=max_tokens,
             **kwargs,
         )
-        content = resp.choices[0].message.content or ""
-        content = _strip_thinking(content)
-        logger.debug("chat() -> %d chars", len(content))
+        raw = resp.choices[0].message.content or ""
+        content = _strip_thinking(raw)
+        # If <think> swallowed everything, log loudly so callers know the
+        # max_tokens budget was too tight for a thinking model rather than
+        # silently returning an empty string downstream.
+        if raw and not content.strip():
+            logger.warning(
+                "chat() returned empty after stripping <think> (raw=%d chars, "
+                "max_tokens=%d). The model spent its entire budget reasoning "
+                "and produced no answer — increase max_tokens.",
+                len(raw), max_tokens,
+            )
+        logger.debug("chat() raw=%d chars, post-strip=%d chars", len(raw), len(content))
         return content.strip()
 
     # ------------------------------------------------------------------
@@ -91,7 +105,7 @@ class LMStudioClient:
         *,
         model: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 10000,
+        max_tokens: int = 32768,
         **kwargs: Any,
     ) -> BaseModel:
         """
@@ -194,3 +208,52 @@ def reset_client() -> None:
     global _client
     with _lock:
         _client = None
+
+
+def unload_model(instance_id: Optional[str] = None) -> bool:
+    """Tell LM Studio to unload a loaded model so the GPU/RAM is freed for
+    the next stage (TTS / Whisper / SDXL / CogVideoX).
+
+    LM Studio exposes its REST API at `/api/v1/*` (parallel to the
+    OpenAI-compatible `/v1/*` we use for chat). When `instance_id` is None,
+    we unload the model the singleton client is configured to use.
+
+    Returns True on success. Returns False (and only logs at INFO) when:
+      - no client has been initialised yet (nothing was loaded),
+      - the server isn't LM Studio (the REST endpoint 404s / connection refused),
+      - the model wasn't actually loaded (LM Studio returns non-200).
+    Never raises — freeing memory is a hint, not a contract.
+    """
+    import httpx
+    client = _client  # the existing singleton
+    if client is None:
+        return False
+
+    base = client.base_url.rstrip("/")
+    # /v1 (OpenAI-compatible) → /api/v1 (LM Studio REST)
+    if base.endswith("/v1"):
+        rest_base = base[:-3] + "/api/v1"
+    else:
+        rest_base = base + "/api/v1"
+    target = instance_id or client.model
+
+    try:
+        resp = httpx.post(
+            f"{rest_base}/models/unload",
+            json={"instance_id": target},
+            headers={"Authorization": f"Bearer {client.api_key}"},
+            timeout=15.0,
+        )
+        if resp.status_code == 200:
+            logger.info("[LM Studio] Unloaded model '%s' to free GPU.", target)
+            return True
+        # 404 = not LM Studio or model not loaded; 4xx generally = wrong instance_id.
+        body = resp.text[:200] if resp.text else ""
+        logger.info(
+            "[LM Studio] Unload returned HTTP %d for '%s' (%s) — continuing.",
+            resp.status_code, target, body,
+        )
+        return False
+    except Exception as exc:
+        logger.info("[LM Studio] Unload skipped (%s) — server may not be LM Studio.", exc)
+        return False

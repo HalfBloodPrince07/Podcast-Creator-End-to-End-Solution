@@ -120,7 +120,10 @@ Return the annotated script followed by the ---FLAGGED--- block. Nothing else.""
             SYSTEM_PROMPT,
             user_prompt,
             temperature=FACT_CHECKER_TEMPERATURE,
-            max_tokens=max(800, count_words(text) * 4),
+            # Floor 4000 leaves room for thinking models to reason before
+            # emitting the annotated script + FLAGGED block. The 800 floor
+            # was sized for non-thinking models and would starve Gemma-4.
+            max_tokens=max(10000, count_words(text) * 4),
         ),
         logger_inst=logger,
     )

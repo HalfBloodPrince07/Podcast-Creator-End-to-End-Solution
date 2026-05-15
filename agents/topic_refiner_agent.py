@@ -83,7 +83,9 @@ async def run_topic_refiner_node(state: Dict[str, Any]) -> Dict[str, Any]:
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=_USER_PROMPT_TEMPLATE.format(raw_topic=raw_topic),
             temperature=0.4,
-            max_tokens=60,
+            # Thinking models need headroom for <think> tokens before the
+            # 1-line refined topic. 60 was too tight — would return empty.
+            max_tokens=8000,
         )
 
         # Sanitise: strip quotes/markdown, collapse whitespace

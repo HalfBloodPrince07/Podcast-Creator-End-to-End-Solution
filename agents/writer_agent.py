@@ -181,12 +181,23 @@ async def _generate_narrative_arc(
                     "Produce the narrative arc now."
                 ),
                 temperature=0.5,
-                max_tokens=350,
+                # Thinking models (Gemma-4 reasoning, DeepSeek-R1, QwQ) need
+                # headroom for <think>...</think> tokens before the actual
+                # output. 350 was too tight — the entire budget got eaten by
+                # reasoning, producing an empty answer after _strip_thinking.
+                max_tokens=5500,
             ),
             logger_inst=logger,
         )
         arc = strip_llm_noise(raw)
-        logger.info("Narrative arc generated:\n%s", arc)
+        if not arc.strip():
+            logger.warning(
+                "Narrative arc came back empty after cleanup — segments will "
+                "be written without a shared spine. Raw response length: %d chars.",
+                len(raw),
+            )
+        else:
+            logger.info("Narrative arc generated:\n%s", arc)
         return arc
     except Exception as exc:
         logger.warning("Narrative arc generation failed (%s) — continuing without it.", exc)
@@ -399,7 +410,9 @@ Return ONLY the revised spoken text."""
                 REVISION_SYSTEM_PROMPT,
                 user_prompt,
                 temperature=WRITER_TEMPERATURE,
-                max_tokens=max(800, target_words * 4),
+                # Floor needs to be high enough for thinking models — Gemma-4
+                # reasoning can eat 2-3 KB of tokens before producing output.
+                max_tokens=max(8000, target_words * 4),
             ),
             logger_inst=logger,
         )
@@ -418,7 +431,10 @@ async def _generate_title(client, topic: str, tone: str, script_preview: str, dr
                 "You are a podcast title writer. Return ONLY the title — no quotes, no explanation.",
                 f"Create a short, catchy podcast episode title (max 10 words) for a {tone} episode about: {topic}\n\nScript preview:\n{script_preview}",
                 temperature=TITLE_TEMPERATURE,
-                max_tokens=30,
+                # Thinking models can spend 1000s of tokens reasoning about
+                # a 10-word title. Give generous headroom — title output is
+                # short so the unused budget costs nothing.
+                max_tokens=8000,
             ),
             logger_inst=logger,
         )

@@ -9,7 +9,7 @@ WRITER_TEMPERATURE = 0.75
 FACT_CHECKER_TEMPERATURE = 0.2
 AUDIO_DESIGNER_TEMPERATURE = 0.3
 TITLE_TEMPERATURE = 0.9
-DEFAULT_LLM_MAX_TOKENS = 10000
+DEFAULT_LLM_MAX_TOKENS = 32768
 
 # ---------------------------------------------------------------------------
 # Search
