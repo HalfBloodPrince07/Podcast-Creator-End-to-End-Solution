@@ -208,10 +208,36 @@ GENDER_VOICES = {
 # ---------------------------------------------------------------------------
 # Chatterbox TTS
 # ---------------------------------------------------------------------------
-CHATTERBOX_DEFAULT_EXAGGERATION = 0.4   # 0.25–2.0; 0.4 gives more expressive, natural delivery
-CHATTERBOX_DEFAULT_CFG_WEIGHT = 0.5     # 0.0–1.0; official default is 0.5 — 0.7 caused repetition
+CHATTERBOX_DEFAULT_EXAGGERATION = 0.45  # baseline emotion intensity (range 0.25–2.0)
+CHATTERBOX_DEFAULT_CFG_WEIGHT = 0.50    # baseline guidance weight (range 0.0–1.0)
+CHATTERBOX_DEFAULT_TEMPERATURE = 0.80   # baseline sampling temperature
 CHATTERBOX_CHUNK_MAX_CHARS = 220        # Chatterbox repeats on long inputs; keep well under 250
 CHATTERBOX_MAX_REFERENCE_DURATION_S = 900000  # cap merged reference audio at 60 s
+
+# Seasoned-podcaster prosody — per-chunk delivery parameters are modulated
+# from the baselines above based on content classification (questions,
+# exclamations, emphasis presence, hook phrases, intimate phrases). See
+# tts_agent._classify_chunk_delivery() for the rules. These constants set
+# the bounds and per-mode deltas so behavior can be tuned without code.
+CHATTERBOX_PROSODY_ENABLED = True
+CHATTERBOX_EXAGGERATION_RANGE = (0.30, 1.00)  # hard clamp after modulation
+CHATTERBOX_CFG_WEIGHT_RANGE = (0.35, 0.70)
+CHATTERBOX_TEMPERATURE_RANGE = (0.65, 0.95)
+# Per-mode adjustments stacked on the baseline. Tune to taste.
+CHATTERBOX_DELTA_INTIMATE = {"exaggeration": -0.10, "cfg_weight": +0.05, "temperature": -0.05}
+CHATTERBOX_DELTA_QUESTION = {"exaggeration": +0.05, "cfg_weight":  0.00, "temperature": +0.05}
+CHATTERBOX_DELTA_EXCLAIM  = {"exaggeration": +0.20, "cfg_weight":  0.00, "temperature": +0.05}
+# Bumped from +0.15 to +0.25 because we no longer uppercase the emphasised
+# word (Chatterbox was reading ALL-CAPS as acronyms — "MYSTERY" → "M-Y-stery").
+# The chunk-level lift is now the ONLY emphasis signal, so we make it count.
+CHATTERBOX_DELTA_EMPHASIS = {"exaggeration": +0.25, "cfg_weight": -0.03, "temperature": +0.02}
+CHATTERBOX_DELTA_REVEAL   = {"exaggeration": +0.15, "cfg_weight": -0.05, "temperature":  0.00}
+CHATTERBOX_DELTA_HOOK     = {"exaggeration": +0.10, "cfg_weight":  0.00, "temperature": +0.05}
+CHATTERBOX_DELTA_CLOSING  = {"exaggeration":  0.00, "cfg_weight": +0.05, "temperature":  0.00}
+# Natural micro-variation between chunks (deterministic per chunk_index).
+CHATTERBOX_JITTER_EXAGGERATION = 0.04
+CHATTERBOX_JITTER_CFG_WEIGHT = 0.03
+CHATTERBOX_JITTER_TEMPERATURE = 0.03
 
 # Voice consistency check (Chatterbox only) — opt-in via env. When enabled,
 # each synthesised chunk is compared against the reference voice; chunks that

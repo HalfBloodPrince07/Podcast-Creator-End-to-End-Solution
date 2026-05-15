@@ -44,6 +44,21 @@ from constants import (
     VOICE_CLONE_REALIGN_INTERVAL,
     CHATTERBOX_DEFAULT_EXAGGERATION,
     CHATTERBOX_DEFAULT_CFG_WEIGHT,
+    CHATTERBOX_DEFAULT_TEMPERATURE,
+    CHATTERBOX_PROSODY_ENABLED,
+    CHATTERBOX_EXAGGERATION_RANGE,
+    CHATTERBOX_CFG_WEIGHT_RANGE,
+    CHATTERBOX_TEMPERATURE_RANGE,
+    CHATTERBOX_DELTA_INTIMATE,
+    CHATTERBOX_DELTA_QUESTION,
+    CHATTERBOX_DELTA_EXCLAIM,
+    CHATTERBOX_DELTA_EMPHASIS,
+    CHATTERBOX_DELTA_REVEAL,
+    CHATTERBOX_DELTA_HOOK,
+    CHATTERBOX_DELTA_CLOSING,
+    CHATTERBOX_JITTER_EXAGGERATION,
+    CHATTERBOX_JITTER_CFG_WEIGHT,
+    CHATTERBOX_JITTER_TEMPERATURE,
     CHATTERBOX_CHUNK_MAX_CHARS,
     TTS_CHUNK_TRIM_HEAD_MS,
     TTS_CHUNK_TRIM_TAIL_MS,
@@ -121,6 +136,226 @@ def _clean_for_tts(text: str) -> str:
     text = strip_markers(text)
     text = _normalize_for_tts(text)
     return text
+
+
+_EMPHASIS_RE = re.compile(r'\[EMPHASIS\](.*?)\[/EMPHASIS\]', re.IGNORECASE | re.DOTALL)
+_PAUSE_SPLIT_RE = re.compile(r'\[PAUSE\s+([\d.]+)\s*(m?s)\]', re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Seasoned-podcaster prosody — content-driven per-chunk delivery parameters
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class _DeliveryParams:
+    """Chatterbox prosody parameters for a single TTS chunk.
+
+    These map directly onto ChatterboxTTS.generate() args:
+      - exaggeration: emotion intensity (0.25 monotone -> 2.0 over-the-top)
+      - cfg_weight:   reference-voice adherence (lower = more variation)
+      - temperature:  sampling stochasticity (higher = more variation)
+    """
+    exaggeration: float
+    cfg_weight: float
+    temperature: float
+    mode_tags: tuple = ()  # human-readable mode names for logging
+
+
+# Content patterns that drive specific delivery modes. These are intentionally
+# conservative to avoid over-classifying — when nothing matches we fall back
+# to the neutral baseline (which itself gets a small per-chunk jitter for
+# natural inconsistency between sentences).
+_RE_QUESTION = re.compile(r'\?')
+_RE_EXCLAIM  = re.compile(r'!')
+# Legacy ALL-CAPS run detector. Kept as a fallback signal for unusual content
+# (acronyms, abbreviations in the source) — the PRIMARY emphasis signal is
+# now the explicit `has_emphasis` flag passed into the classifier, because
+# uppercasing the inner word made Chatterbox spell it letter-by-letter.
+_RE_EMPHASIS_CAPS = re.compile(r'\b[A-Z]{3,}\b')
+# "Revelation" cues: phrases a seasoned podcaster lands harder.
+_RE_REVELATION = re.compile(
+    r"\b("
+    r"but\s+here[''](?:s| is)|"
+    r"here[''](?:s| is)\s+(?:the|why|where|what|how)|"
+    r"and\s+yet|"
+    r"except|"
+    r"surprisingly|"
+    r"the\s+catch\s+is|"
+    r"it\s+turns\s+out|"
+    r"the\s+truth\s+is|"
+    r"plot\s+twist"
+    r")\b",
+    re.IGNORECASE,
+)
+# "Hook" cues: openers and attention grabs delivered with more energy.
+_RE_HOOK = re.compile(
+    r"\b("
+    r"imagine|"
+    r"picture\s+this|"
+    r"wait[,.]|"
+    r"hold\s+on|"
+    r"stop[,.]|"
+    r"you\s+won[''](?:t| not)\s+believe|"
+    r"get\s+this|"
+    r"check\s+this\s+out|"
+    r"listen[,.]"
+    r")\b",
+    re.IGNORECASE,
+)
+# "Intimate" cues: lines a podcaster pulls IN on (softer, more confidential).
+_RE_INTIMATE = re.compile(
+    r"\b("
+    r"honestly|"
+    r"truthfully|"
+    r"between\s+you\s+and\s+me|"
+    r"let\s+me\s+tell\s+you|"
+    r"i[''](?:ll| will)\s+be\s+honest|"
+    r"to\s+be\s+real"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_chunk_delivery(
+    text: str,
+    chunk_index: int,
+    total_chunks: int,
+    *,
+    seed: int = 0,
+    has_emphasis: bool = False,
+) -> _DeliveryParams:
+    """Pick Chatterbox prosody parameters that match what this chunk is saying.
+
+    Mimics how a seasoned podcaster modulates delivery on the fly: questions
+    rise, exclamations punch, revelations land harder, intimate confessions
+    pull in, hooks lean forward. Each modulation is a small delta stacked on
+    the baseline; the final params get a tiny deterministic jitter so two
+    adjacent neutral sentences don't sound identical (human inconsistency).
+
+    Returns the same params regardless of seed — only the per-chunk jitter
+    uses the seed so the voice-consistency reroll can use a different TTS
+    seed without re-shuffling the prosody choices.
+    """
+    if not CHATTERBOX_PROSODY_ENABLED:
+        return _DeliveryParams(
+            exaggeration=CHATTERBOX_DEFAULT_EXAGGERATION,
+            cfg_weight=CHATTERBOX_DEFAULT_CFG_WEIGHT,
+            temperature=CHATTERBOX_DEFAULT_TEMPERATURE,
+            mode_tags=("disabled",),
+        )
+
+    has_q = bool(_RE_QUESTION.search(text))
+    has_excl = bool(_RE_EXCLAIM.search(text))
+    # Primary signal: caller's explicit `has_emphasis` flag (from [EMPHASIS]
+    # tag detection BEFORE stripping). Fallback: ALL-CAPS run in the cleaned
+    # text — catches genuine acronyms/abbreviations that should also punch.
+    has_emph = has_emphasis or bool(_RE_EMPHASIS_CAPS.search(text))
+    is_reveal = bool(_RE_REVELATION.search(text))
+    is_hook = bool(_RE_HOOK.search(text))
+    is_intimate = bool(_RE_INTIMATE.search(text))
+    is_opening = chunk_index == 0
+    is_closing = chunk_index == total_chunks - 1 and total_chunks > 1
+
+    exaggeration = CHATTERBOX_DEFAULT_EXAGGERATION
+    cfg_weight   = CHATTERBOX_DEFAULT_CFG_WEIGHT
+    temperature  = CHATTERBOX_DEFAULT_TEMPERATURE
+    tags: list[str] = []
+
+    def _apply(delta: dict, tag: str) -> None:
+        nonlocal exaggeration, cfg_weight, temperature
+        exaggeration += delta.get("exaggeration", 0.0)
+        cfg_weight   += delta.get("cfg_weight", 0.0)
+        temperature  += delta.get("temperature", 0.0)
+        tags.append(tag)
+
+    # Intimate is applied FIRST because subsequent cues (questions etc.) may
+    # override it — a question inside an "honestly..." line should still rise.
+    if is_intimate:
+        _apply(CHATTERBOX_DELTA_INTIMATE, "intimate")
+    if has_q:
+        _apply(CHATTERBOX_DELTA_QUESTION, "question")
+    if has_excl:
+        _apply(CHATTERBOX_DELTA_EXCLAIM, "exclaim")
+    if has_emph:
+        _apply(CHATTERBOX_DELTA_EMPHASIS, "emphasis")
+    if is_reveal:
+        _apply(CHATTERBOX_DELTA_REVEAL, "revelation")
+    if is_hook or is_opening:
+        _apply(CHATTERBOX_DELTA_HOOK, "hook" if is_hook else "opening")
+    if is_closing:
+        _apply(CHATTERBOX_DELTA_CLOSING, "closing")
+    if not tags:
+        tags.append("neutral")
+
+    # Deterministic jitter so two adjacent neutral chunks still sound slightly
+    # different — that micro-inconsistency is what stops the output from
+    # sounding like the same line read twice.
+    import random
+    rng = random.Random((seed * 1000003) ^ (chunk_index + 1) * 2654435761)
+    exaggeration += rng.uniform(-CHATTERBOX_JITTER_EXAGGERATION, CHATTERBOX_JITTER_EXAGGERATION)
+    cfg_weight   += rng.uniform(-CHATTERBOX_JITTER_CFG_WEIGHT,   CHATTERBOX_JITTER_CFG_WEIGHT)
+    temperature  += rng.uniform(-CHATTERBOX_JITTER_TEMPERATURE,  CHATTERBOX_JITTER_TEMPERATURE)
+
+    return _DeliveryParams(
+        exaggeration=max(CHATTERBOX_EXAGGERATION_RANGE[0], min(CHATTERBOX_EXAGGERATION_RANGE[1], exaggeration)),
+        cfg_weight=max(CHATTERBOX_CFG_WEIGHT_RANGE[0],     min(CHATTERBOX_CFG_WEIGHT_RANGE[1],   cfg_weight)),
+        temperature=max(CHATTERBOX_TEMPERATURE_RANGE[0],   min(CHATTERBOX_TEMPERATURE_RANGE[1],  temperature)),
+        mode_tags=tuple(tags),
+    )
+
+
+def _strip_emphasis_tags(text: str) -> str:
+    """Remove [EMPHASIS]...[/EMPHASIS] tags but keep the inner word in its
+    original case.
+
+    Earlier versions of this code uppercased the inner word as a hack to
+    drive stronger Chatterbox delivery. That backfired badly: Chatterbox's
+    BPE tokenizer treats ALL-CAPS words like acronyms (FBI, ATM, USA), so
+    "MYSTERY" came out pronounced "M-Y-stery". Better to leave the word
+    alone and lift the WHOLE CHUNK'S exaggeration via the classifier when
+    emphasis is present — the moment lands, the word stays a word.
+    """
+    return _EMPHASIS_RE.sub(lambda m: m.group(1), text)
+
+
+def _has_emphasis(text: str) -> bool:
+    """True if `text` contains at least one [EMPHASIS]...[/EMPHASIS] tag."""
+    return bool(_EMPHASIS_RE.search(text))
+
+
+def _split_by_pauses(text: str) -> list[tuple[str, float]]:
+    """Split text on [PAUSE Xms] / [PAUSE Xs] markers into (piece, silence_after_seconds).
+
+    The last piece always has silence_after=0.0 (nothing to pause for at the
+    end). Pieces preserve any OTHER markers (CUE, VISUAL, SRC, EMPHASIS) for
+    a later strip pass — only the pause markers are consumed here so we can
+    drive real numpy silence between TTS chunks instead of letting the
+    markers get stripped away unused.
+    """
+    parts = _PAUSE_SPLIT_RE.split(text)
+    # _PAUSE_SPLIT_RE has 2 capture groups, so split() interleaves:
+    #   [text0, dur0, unit0, text1, dur1, unit1, ..., textN]
+    result: list[tuple[str, float]] = []
+    i = 0
+    while i < len(parts):
+        piece = parts[i] if i < len(parts) else ""
+        if i + 2 < len(parts):
+            try:
+                dur = float(parts[i + 1])
+                unit = (parts[i + 2] or "s").lower()
+                silence_s = dur / 1000.0 if unit == "ms" else dur
+                # Clamp to sane range — accept up to 4s even if writer overcooks.
+                silence_s = max(0.0, min(4.0, silence_s))
+            except (ValueError, TypeError, AttributeError):
+                silence_s = 0.0
+            result.append((piece, silence_s))
+            i += 3
+        else:
+            result.append((piece, 0.0))
+            i += 1
+    return result
 
 
 def _split_long_sentence(sentence: str, max_chars: int) -> list[str]:
@@ -604,13 +839,18 @@ class _ChatterboxBackend:
         audio_prompt_path: str | None = None,
         exaggeration: float = CHATTERBOX_DEFAULT_EXAGGERATION,
         cfg_weight: float = CHATTERBOX_DEFAULT_CFG_WEIGHT,
+        temperature: float = CHATTERBOX_DEFAULT_TEMPERATURE,
         seed: int = 42,
     ) -> tuple:
         """Returns (np.ndarray, sample_rate). audio_prompt_path is optional reference WAV.
         `seed` is settable so the consistency checker can re-roll the same chunk."""
         import torch
 
-        kwargs: dict = {"exaggeration": exaggeration, "cfg_weight": cfg_weight}
+        kwargs: dict = {
+            "exaggeration": exaggeration,
+            "cfg_weight": cfg_weight,
+            "temperature": temperature,
+        }
         if audio_prompt_path:
             kwargs["audio_prompt_path"] = audio_prompt_path
 
@@ -784,24 +1024,84 @@ def _run_tts_sync(
             continue
 
         chunk_max = CHATTERBOX_CHUNK_MAX_CHARS if backend_name == "chatterbox" else TTS_CHUNK_MAX_CHARS
-        chunks = _chunk_text(clean_text, max_chars=chunk_max)
+
+        # Build (chunk_text, silence_after_seconds, has_emphasis) triples that
+        # honor the audio-designer's [PAUSE Xms] markers as real variable
+        # silence AND track [EMPHASIS] presence per chunk (used by the
+        # classifier to lift exaggeration on emphasised chunks). We deliberately
+        # do NOT uppercase the emphasised word — Chatterbox's BPE tokenizer
+        # reads ALL-CAPS as acronyms and spells the letters out.
+        raw_text = seg.get("text", "") or ""
+        pieces = _split_by_pauses(raw_text)
+        chunks_with_silence: list[tuple[str, float, bool]] = []
+        for piece_idx, (piece, sec_after) in enumerate(pieces):
+            # Detect emphasis BEFORE stripping so the flag survives the clean pass.
+            piece_has_emphasis = _has_emphasis(piece)
+            # Strip emphasis tags but keep inner word in its natural case.
+            piece_no_emph = _strip_emphasis_tags(piece)
+            piece_clean = _clean_for_tts(piece_no_emph)
+            if not piece_clean.strip():
+                # Empty piece (just markers) — fold its pause into the prior chunk's silence.
+                if chunks_with_silence and sec_after > 0:
+                    prev_text, prev_silence, prev_emph = chunks_with_silence[-1]
+                    chunks_with_silence[-1] = (prev_text, prev_silence + sec_after, prev_emph)
+                continue
+            sub_chunks = _chunk_text(piece_clean, max_chars=chunk_max)
+            for sub_idx, sub in enumerate(sub_chunks):
+                is_last_of_piece = sub_idx == len(sub_chunks) - 1
+                if is_last_of_piece and sec_after > 0:
+                    # End of an explicit pause boundary — use the marker's duration.
+                    silence_after = sec_after
+                else:
+                    # Mid-piece chunk boundary OR last-piece-of-segment: default inter-chunk silence.
+                    silence_after = TTS_INTER_CHUNK_SILENCE_S
+                chunks_with_silence.append((sub, silence_after, piece_has_emphasis))
+        if not chunks_with_silence:
+            # Fall back to the legacy path if the pause split somehow yielded nothing usable.
+            chunks_with_silence = [(c, TTS_INTER_CHUNK_SILENCE_S, False) for c in _chunk_text(clean_text, max_chars=chunk_max)]
+
+        chunks = [c for c, _, _ in chunks_with_silence]  # back-compat for logs / voice-check
+        total_chars = sum(len(c) for c in chunks)
+        marker_pause_total = sum(s for (_, s, _) in chunks_with_silence if s != TTS_INTER_CHUNK_SILENCE_S)
         logger.info(
-            "Synthesising [%s] '%s' with voice=%s (%d chunks, %d chars)...",
+            "Synthesising [%s] '%s' with voice=%s (%d chunks, %d chars, %.1fs marker-driven silence)...",
             backend_name,
             seg_name,
             voice,
             len(chunks),
-            len(clean_text),
+            total_chars,
+            marker_pause_total,
         )
         seg_start = time.perf_counter()
 
         seg_audio: list = []
-        for i, chunk in enumerate(chunks, 1):
+        for i, (chunk, silence_after_s, chunk_has_emphasis) in enumerate(chunks_with_silence, 1):
             try:
                 t0 = time.perf_counter()
                 if backend_name == "chatterbox":
                     chunk = _ensure_punctuation(chunk)
-                    audio_arr, sr = backend_cls.synthesise(chunk, audio_prompt_path=voice)
+                    # Seasoned-podcaster prosody: pick delivery params based
+                    # on what THIS chunk is saying (question, exclamation,
+                    # emphasis, reveal, hook, intimate, closing, opening) +
+                    # tiny per-chunk jitter for natural inconsistency.
+                    delivery = _classify_chunk_delivery(
+                        chunk,
+                        chunk_index=i - 1,
+                        total_chunks=len(chunks_with_silence),
+                        has_emphasis=chunk_has_emphasis,
+                    )
+                    logger.info(
+                        "  chunk %d/%d delivery=%s exag=%.2f cfg=%.2f temp=%.2f",
+                        i, len(chunks_with_silence), ",".join(delivery.mode_tags),
+                        delivery.exaggeration, delivery.cfg_weight, delivery.temperature,
+                    )
+                    audio_arr, sr = backend_cls.synthesise(
+                        chunk,
+                        audio_prompt_path=voice,
+                        exaggeration=delivery.exaggeration,
+                        cfg_weight=delivery.cfg_weight,
+                        temperature=delivery.temperature,
+                    )
                     # Voice consistency: re-roll up to MAX_REROLLS times on drift
                     if voice_checker is not None:
                         score = voice_checker.score(audio_arr, sr, voice)
@@ -815,7 +1115,12 @@ def _run_tts_sync(
                                 attempts, CHATTERBOX_MAX_REROLLS, seed,
                             )
                             audio_arr, sr = backend_cls.synthesise(
-                                chunk, audio_prompt_path=voice, seed=seed,
+                                chunk,
+                                audio_prompt_path=voice,
+                                exaggeration=delivery.exaggeration,
+                                cfg_weight=delivery.cfg_weight,
+                                temperature=delivery.temperature,
+                                seed=seed,
                             )
                             score = voice_checker.score(audio_arr, sr, voice)
                         logger.info("[VoiceCheck] chunk %d final score=%.2f", i, score)
@@ -834,7 +1139,9 @@ def _run_tts_sync(
                 )
                 seg_audio.append(audio_arr)
                 sample_rate = sr
-                silence = np.zeros(int(sr * TTS_INTER_CHUNK_SILENCE_S), dtype="float32")
+                # Per-chunk silence is now driven by the audio designer's
+                # [PAUSE Xms] markers (variable) instead of a fixed default.
+                silence = np.zeros(int(sr * silence_after_s), dtype="float32")
                 seg_audio.append(silence)
             except Exception as exc:
                 logger.error("TTS error in '%s' chunk %d: %s", seg_name, i, exc)
@@ -920,6 +1227,16 @@ async def run_tts_node(state: dict) -> dict:
     LangGraph node: synthesise speech from annotated script segments.
     Backend is chosen from state['tts_backend'] → env TTS_BACKEND → 'kokoro'.
     """
+    # The audio designer was the last LLM consumer in the graph. Tell LM
+    # Studio to unload its weights now so TTS / Whisper / SDXL / CogVideoX
+    # have the GPU to themselves. Best-effort — non-LM-Studio servers no-op.
+    try:
+        from llm_client import unload_model
+        if not state.get("dry_run"):
+            unload_model()
+    except Exception as exc:
+        logger.info("LLM unload before TTS skipped: %s", exc)
+
     script_segments = state.get("script_segments", [])
     dry_run = state.get("dry_run", False)
     multi_voice = state.get("multi_voice", False)

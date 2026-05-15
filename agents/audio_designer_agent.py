@@ -21,27 +21,90 @@ from utils import get_logger, count_words, async_retry_llm_call, strip_llm_noise
 
 logger = get_logger("AudioDesignerAgent")
 
-PROSODY_SYSTEM_PROMPT = """You are the audio director for a hit podcast. Add prosody markers that make the host \
-sound like a real person telling an exciting story — not a robot reading text.
+PROSODY_SYSTEM_PROMPT = """You are the audio director for a hit podcast. Your job is to mark up the \
+script so the TTS engine delivers it like a seasoned podcaster, not a robot reading text.
 
-PAUSE RULES:
-- [PAUSE 500ms] — after a comma in a list or complex clause; after a rhetorical question.
-- [PAUSE 1s]    — BEFORE a surprising fact or key revelation (build anticipation before it lands);
-                  at the end of a major idea before moving to the next point.
-- [PAUSE 2s]    — only for the single most dramatic moment in the whole segment. Use at most once.
+The downstream TTS engine (Chatterbox) does two things with what you write:
+1. It honors [PAUSE Xms] markers as REAL silence in the audio output (variable, exact duration).
+2. It modulates voice delivery (energy, pitch, emotion) based on PUNCTUATION and content cues. \
+   Specifically: question marks → rising pitch, exclamation marks → harder punch, ALL-CAPS \
+   words → stronger emphasis, certain phrases ("but here's the thing", "imagine", "honestly", \
+   "wait,") → automatically remapped to specific delivery modes.
 
-EMPHASIS RULES:
-- [EMPHASIS]...[/EMPHASIS] — wrap the 1–3 words with the most emotional or informational weight.
-  Prefer: numbers and statistics, contrasting words ("but", "except", "only", "never"),
-  and the core topic keyword in each paragraph.
-- Maximum 2 EMPHASIS tags per paragraph.
-- Never emphasise articles (a, the), pronouns, or filler words.
+So your job is to encode prosody in three ways: PAUSE markers, EMPHASIS markers, and \
+delivery-cue phrases / punctuation that survive the TTS preprocessor.
 
-GENERAL RULES:
-- Do NOT change any words. Do NOT remove any text. Only INSERT the markers.
+================ PAUSE MARKERS — variable real silence ================
+
+Mix all six tiers densely. Short pauses dominate; long pauses are rare and earned.
+
+- [PAUSE 250ms] — micro-pause for thought, between clauses inside a long sentence, \
+  before a sharp aside. Appears FREQUENTLY (every 30-50 words on average).
+- [PAUSE 500ms] — after a comma in a list of three or more; after most rhetorical questions; \
+  after a period inside a paragraph when the next sentence shifts angle.
+- [PAUSE 750ms] — a beat of reflection, before a small pivot phrase \
+  ("but here's the thing", "and yet").
+- [PAUSE 1s]    — BEFORE a surprising fact or revelation (build anticipation before it lands).
+- [PAUSE 1.5s]  — a meaningful breath, used once or twice per segment.
+- [PAUSE 2s]    — the single most dramatic moment. Max once per segment.
+
+TARGET DENSITY: a 250-word segment should carry 12–20 PAUSE markers across the six tiers.
+
+================ EMPHASIS MARKERS — stronger word delivery ================
+
+[EMPHASIS]...[/EMPHASIS] wraps 1–3 words. The tags are removed before TTS but their PRESENCE \
+in a chunk triggers an exaggeration spike on the WHOLE chunk's delivery — louder, more \
+intense voicing throughout the surrounding sentence, so the emphasis lands as a moment.
+
+- Prefer: numbers and statistics, contrasting words ("but", "except", "only", "never"), \
+  surprising verbs ("collapsed", "exploded", "vanished"), and the core topic keyword in each paragraph.
+- 2–4 EMPHASIS tags per paragraph.
+- Never emphasise articles (a, the), pronouns (it, this, that), or filler words.
+- The emphasised word itself is read in its NORMAL case — the TTS doesn't shout it letter-by-letter. \
+  The lift comes from the chunk-level voice intensity, not from changing the word.
+
+================ PUNCTUATION + PHRASES — drive delivery mode ================
+
+The TTS engine classifies each chunk's delivery based on content. Use these intentionally:
+
+- QUESTION MARKS (?) — rising pitch and slightly more sampling variation. Use freely for \
+  rhetorical questions ("So what does that actually mean?"). The narrative arc allowed 1-2 \
+  per paragraph; for prosody, you can ADD ? where the natural reading already feels questioning.
+- EXCLAMATION MARKS (!) — significantly more punch. Use sparingly (max 2 per segment) for \
+  genuine surprise or peak energy. Overuse sounds desperate.
+- PERIODS (.) — falling pitch, finality. Use when a thought genuinely lands.
+- COMMAS (,) — short rhythmic micro-breath. The TTS handles these naturally.
+- Single hyphens (-) — survive the preprocessor as soft separators.
+
+Delivery-cue PHRASES that the TTS engine recognises and renders with specific modes \
+(prefer them where natural — do NOT insert artificially):
+
+- HOOK mode (more energy, faster delivery): \
+  "imagine ...", "picture this ...", "wait, ...", "hold on", "stop, ...", \
+  "you won't believe ...", "get this", "check this out", "listen, ..."
+- REVELATION mode (harder landing, slight slowdown): \
+  "but here's the thing ...", "here's why / where / what ...", "and yet ...", \
+  "except ...", "surprisingly ...", "the catch is ...", "it turns out ...", \
+  "the truth is ...", "plot twist ..."
+- INTIMATE mode (pulled-in, softer, slightly slower): \
+  "honestly ...", "truthfully ...", "between you and me ...", "let me tell you ...", \
+  "i'll be honest ...", "to be real ..."
+
+When the script already contains one of these phrases naturally, keep it. When the writer \
+wrote something flatter that COULD have been one of these, you may REWRITE that exact phrase \
+to the matching cue WITHOUT changing the surrounding meaning (e.g. "another important point \
+is..." → "but here's the thing — ..."). Do this 1-3 times per segment maximum.
+
+================ DO-NOT RULES ================
+
+- Do NOT change any factual content. Do NOT remove sentences.
+- Do NOT use ellipses (...), colons (:), em-dashes (—), or semicolons (;). The TTS \
+  preprocessor silently converts ALL of these to commas before the model sees them. Wasted \
+  characters. Use [PAUSE Xms] markers instead.
 - Do NOT add markers inside quoted text.
-- Vary pause lengths — a script where every pause is [PAUSE 1s] sounds robotic.
-- Return ONLY the marked-up text, no explanations."""
+- A segment with all 250ms pauses sounds as robotic as one with all 1s pauses — mix tiers.
+
+Return ONLY the marked-up text. No explanations, no JSON, no commentary."""
 
 
 def _rule_based_markers(text: str) -> str:
@@ -163,7 +226,7 @@ async def _llm_visual_markers(client, seg_name: str, text: str) -> str:
     """LLM-driven [VISUAL:] insertion. Falls back to rule-based on any failure."""
     from utils import strip_markers
     word_count = count_words(text)
-    budget = max(2048, word_count * 8)
+    budget = max(8000, word_count * 8)
     try:
         raw = await async_retry_llm_call(
             lambda: client.system_user(
@@ -200,7 +263,7 @@ async def _llm_markers(client, seg_name: str, text: str) -> str:
     # prompt this short, leaving nothing after stripping. Give a generous floor
     # AND a /no_think hint so non-thinking output is preferred when supported.
     word_count = count_words(text)
-    budget = max(2048, word_count * 8)
+    budget = max(8000, word_count * 8)
     try:
         raw = await async_retry_llm_call(
             lambda: client.system_user(
