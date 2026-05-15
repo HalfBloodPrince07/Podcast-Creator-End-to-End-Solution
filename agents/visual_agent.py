@@ -63,48 +63,149 @@ logger = get_logger("VisualAgent")
 # ---------------------------------------------------------------------------
 
 class _SDXLBackend:
-    """Lazily-loaded SDXL base pipeline. Singleton, with explicit unload."""
+    """Lazily-loaded SDXL base pipeline. Singleton, with explicit unload.
 
+    `_load_lock` serializes concurrent load() calls. Without it, two
+    simultaneous build_visual_bed invocations (e.g. frontend auto-fire
+    racing a manual click) both pass the `if _loaded` check and try to
+    materialize the same meta-tensor pipeline in parallel, which crashes
+    with "Cannot copy out of meta tensor; no data!" on one of them.
+    """
+
+    import threading as _threading
     _pipe = None
     _loaded = False
+    _load_lock = _threading.Lock()
 
     @classmethod
     def load(cls) -> bool:
         if cls._loaded:
             return True
-        try:
-            import torch
-            from diffusers import StableDiffusionXLPipeline
+        with cls._load_lock:
+            # Recheck under the lock — the racing caller may have already loaded.
+            if cls._loaded:
+                return True
+            try:
+                import torch
+                from diffusers import StableDiffusionXLPipeline
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if device == "cuda" else torch.float32
-            logger.info("[SDXL] Loading %s on %s (%s)...", SDXL_MODEL_ID, device, dtype)
-            pipe = StableDiffusionXLPipeline.from_pretrained(
-                SDXL_MODEL_ID,
-                torch_dtype=dtype,
-                use_safetensors=True,
-                variant="fp16" if device == "cuda" else None,
-            )
-            if device == "cuda":
-                pipe = pipe.to("cuda")
-                # Memory-friendly settings for 16 GB VRAM
-                try:
-                    pipe.enable_attention_slicing()
-                except Exception:
-                    pass
-                try:
-                    pipe.enable_vae_tiling()
-                except Exception:
-                    pass
-            cls._pipe = pipe
-            cls._loaded = True
-            logger.info("[SDXL] Loaded.")
-            return True
-        except ImportError as exc:
-            logger.warning("[SDXL] diffusers/transformers missing (%s) — visual bed will be skipped.", exc)
-        except Exception as exc:
-            logger.warning("[SDXL] Failed to load: %s — visual bed will be skipped.", exc)
-        return False
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                dtype = torch.float16 if device == "cuda" else torch.float32
+                logger.info("[SDXL] Loading %s on %s (%s)...", SDXL_MODEL_ID, device, dtype)
+                pipe = StableDiffusionXLPipeline.from_pretrained(
+                    SDXL_MODEL_ID,
+                    torch_dtype=dtype,
+                    use_safetensors=True,
+                    variant="fp16" if device == "cuda" else None,
+                )
+                if device == "cuda":
+                    pipe = pipe.to("cuda")
+                    # Memory-friendly settings for 16 GB VRAM
+                    try:
+                        pipe.enable_attention_slicing()
+                    except Exception:
+                        pass
+                    try:
+                        pipe.enable_vae_tiling()
+                    except Exception:
+                        pass
+                cls._pipe = pipe
+                cls._loaded = True
+                logger.info("[SDXL] Loaded.")
+                return True
+            except ImportError as exc:
+                logger.warning("[SDXL] diffusers/transformers missing (%s) — visual bed will be skipped.", exc)
+            except Exception as exc:
+                logger.warning("[SDXL] Failed to load: %s — visual bed will be skipped.", exc)
+            return False
+
+    @classmethod
+    def _encode_long_prompt(cls, prompt: str, negative_prompt: str):
+        """Chunked CLIP encoding so prompts longer than 77 tokens aren't truncated.
+
+        Both SDXL text encoders (CLIP-L and OpenCLIP-G) cap at 77 tokens
+        each. Our detailed beat-director prompts run 100-150+ tokens after
+        the style suffix is appended, so the tail (palette, texture, mood,
+        style words) was being silently dropped. Standard fix: split the
+        prompt into 75-token chunks, encode each through both encoders,
+        and concatenate along the token dimension. The SDXL pipeline
+        accepts the result as `prompt_embeds` + `pooled_prompt_embeds`.
+        """
+        import torch
+        import logging as _logging
+        pipe = cls._pipe
+        device = pipe.device
+
+        # Tokenizing without truncation logs a "sequence length > 77" warning
+        # every call. We KNOW it's >77 — that's why we're chunking. Mute it
+        # only for the duration of this encode, then restore.
+        _tok_logger = _logging.getLogger("transformers.tokenization_utils_base")
+        _prev_level = _tok_logger.level
+        _tok_logger.setLevel(_logging.ERROR)
+
+        def _encode_one(text: str):
+            emb_l, emb_g = [], []
+            pooled_g = None
+            for tok, enc, sink in (
+                (pipe.tokenizer,   pipe.text_encoder,   emb_l),
+                (pipe.tokenizer_2, pipe.text_encoder_2, emb_g),
+            ):
+                ids_full = tok(text, padding=False, truncation=False, return_tensors="pt").input_ids[0]
+                # Strip BOS/EOS that the tokenizer added; we re-wrap each chunk.
+                core = ids_full
+                if len(core) >= 1 and tok.bos_token_id is not None and core[0].item() == tok.bos_token_id:
+                    core = core[1:]
+                if len(core) >= 1 and tok.eos_token_id is not None and core[-1].item() == tok.eos_token_id:
+                    core = core[:-1]
+                max_len = tok.model_max_length  # 77 for both SDXL tokenizers
+                inner = max_len - 2  # leave room for BOS + EOS
+                if len(core) == 0:
+                    chunks_core = [torch.tensor([], dtype=torch.long)]
+                else:
+                    chunks_core = [core[i:i + inner] for i in range(0, len(core), inner)]
+                for chunk_core in chunks_core:
+                    pad_len = max_len - len(chunk_core) - 2
+                    ids = torch.cat([
+                        torch.tensor([tok.bos_token_id], dtype=torch.long),
+                        chunk_core.to(torch.long),
+                        torch.tensor([tok.eos_token_id], dtype=torch.long),
+                        torch.full((pad_len,), tok.pad_token_id or 0, dtype=torch.long),
+                    ]).unsqueeze(0).to(device)
+                    out = enc(ids, output_hidden_states=True)
+                    # SDXL uses the penultimate hidden state, not the last.
+                    sink.append(out.hidden_states[-2])
+                    # Pooled output comes from the OpenCLIP-G encoder's
+                    # FIRST chunk only — encodes the overall sentence semantics.
+                    if tok is pipe.tokenizer_2 and pooled_g is None:
+                        # text_embeds is the pooled output for CLIPTextModelWithProjection
+                        pooled_g = out[0]
+            # Token-dim concat per encoder
+            e_l = torch.cat(emb_l, dim=1)
+            e_g = torch.cat(emb_g, dim=1)
+            # Tokenizers can split slightly differently; trim to common length.
+            n = min(e_l.shape[1], e_g.shape[1])
+            embeds = torch.cat([e_l[:, :n, :], e_g[:, :n, :]], dim=-1)
+            return embeds, pooled_g
+
+        try:
+            pos_embeds, pos_pooled = _encode_one(prompt)
+            neg_embeds, neg_pooled = _encode_one(negative_prompt or "")
+        finally:
+            _tok_logger.setLevel(_prev_level)
+
+        # Positive and negative must have matching token counts. Pad the shorter
+        # one with zeros (SDXL's negative pad is just absence of signal).
+        diff = pos_embeds.shape[1] - neg_embeds.shape[1]
+        if diff > 0:
+            pad = torch.zeros(neg_embeds.shape[0], diff, neg_embeds.shape[2],
+                              device=device, dtype=neg_embeds.dtype)
+            neg_embeds = torch.cat([neg_embeds, pad], dim=1)
+        elif diff < 0:
+            pad = torch.zeros(pos_embeds.shape[0], -diff, pos_embeds.shape[2],
+                              device=device, dtype=pos_embeds.dtype)
+            pos_embeds = torch.cat([pos_embeds, pad], dim=1)
+
+        return pos_embeds, pos_pooled, neg_embeds, neg_pooled
 
     @classmethod
     def generate(cls, prompt: str, seed: int = 42) -> Optional["Image.Image"]:
@@ -115,9 +216,16 @@ class _SDXLBackend:
             import torch
             generator = torch.Generator(device=cls._pipe.device).manual_seed(seed)
             with torch.inference_mode():
+                # Chunked encoding -> long prompts (palette, texture, mood,
+                # and the style suffix) survive without 77-token truncation.
+                p_emb, p_pool, n_emb, n_pool = cls._encode_long_prompt(
+                    prompt, SDXL_NEGATIVE_PROMPT,
+                )
                 result = cls._pipe(
-                    prompt=prompt,
-                    negative_prompt=SDXL_NEGATIVE_PROMPT,
+                    prompt_embeds=p_emb,
+                    pooled_prompt_embeds=p_pool,
+                    negative_prompt_embeds=n_emb,
+                    negative_pooled_prompt_embeds=n_pool,
                     width=SDXL_WIDTH,
                     height=SDXL_HEIGHT,
                     num_inference_steps=SDXL_STEPS,
@@ -161,14 +269,21 @@ class _CogVideoXBackend:
 
     _pipe = None
     _loaded = False
-    _unavailable_reason: str | None = None
+    # Two flavours of failure:
+    #  - HARD: import missing or CUDA absent. These don't change at runtime,
+    #          cache forever (until process restart) so we don't reimport on
+    #          every cue. Recorded as a string.
+    #  - SOFT: model download in flight, transient OOM, HF cache corruption.
+    #          These DO change at runtime (the next request might succeed),
+    #          so we don't cache them — every load() re-attempts.
+    _unavailable_reason: str | None = None  # only set for HARD failures
+    _last_soft_failure: str | None = None    # informational; not a short-circuit
 
     @classmethod
     def load(cls) -> bool:
         if cls._loaded:
             return True
-        # Once we've recorded a hard unavailability reason, stop retrying so
-        # we don't pay the import cost (and log spam) on every cue interval.
+        # Hard failures persist across the process — never retry.
         if cls._unavailable_reason is not None:
             return False
         try:
@@ -213,8 +328,15 @@ class _CogVideoXBackend:
             logger.info("[CogVideoX] Loaded.")
             return True
         except Exception as exc:
-            cls._unavailable_reason = f"CogVideoX failed to load: {exc}"
-            logger.warning("[CogVideoX] %s", cls._unavailable_reason)
+            # SOFT failure — could be a download still in flight, transient OOM,
+            # or cache corruption that gets cleaned up on retry. Don't latch
+            # _unavailable_reason; the next request might succeed.
+            cls._last_soft_failure = f"CogVideoX failed to load: {exc}"
+            logger.warning(
+                "[CogVideoX] %s — will retry on next request "
+                "(not caching the failure; restart the server only if the same "
+                "error reappears).", cls._last_soft_failure,
+            )
             return False
 
     @classmethod
@@ -323,63 +445,266 @@ def _stretch_clip_to_duration(
 
 
 # ---------------------------------------------------------------------------
-# Visual director (LLM pass — turns each script segment into a sequence of
-# detailed, distinct image prompts proportional to that segment's duration)
+# Visual director (whisper-driven) — group spoken audio into ~12s "beats" at
+# sentence boundaries, then ask the LLM for one cinematic prompt per beat
+# grounded in the literal text of that beat. Beat ms-bounds come from
+# Whisper word timings, so visuals fire exactly when the words are spoken.
 # ---------------------------------------------------------------------------
 
-DIRECTOR_SYSTEM_PROMPT = """You are the visual director for a podcast video. \
-Your job is to turn a spoken script segment into a chronological list of \
-photographable scenes the AI image model will render.
+BEAT_DIRECTOR_SYSTEM = """You are the visual director for a podcast video. \
+You will receive a numbered list of short audio beats — each one is the exact \
+text the speaker says during a ~12 second window. For each beat, write ONE \
+extremely detailed, image-model-ready cinematic prompt depicting exactly what \
+the speaker is talking about at that moment.
 
-OUTPUT RULES (must follow exactly):
-- Output ONE prompt per line. No numbering, no bullets, no explanations.
-- Output EXACTLY {target_count} lines.
-- Each prompt is a single line of comma-separated descriptors.
-- Each prompt describes a DIFFERENT physical scene — no two lines may share \
-the same subject, setting, or composition. Vary subject, location, time of \
-day, camera angle, and color palette.
-- Each prompt must be photographable: describe a concrete subject, a setting, \
-lighting, and camera/lens style. Translate ideas into physical things a camera \
-could capture. Do NOT describe text, slides, charts, logos, UI mockups, or \
-abstract concepts.
-- Walk chronologically through the segment — line N depicts the moment ~N/{target_count} \
-into the segment.
-- Do NOT include style suffixes like "cinematic, 35mm" — those are appended later."""
+OUTPUT FORMAT (must follow exactly):
+- Output exactly one prompt per beat, numbered "1. ", "2. ", "3. ", ... in order.
+- One prompt per line. No headers, no commentary, no code fences, no blank \
+lines between, no quotation marks around the prompt.
+
+EACH PROMPT MUST INCLUDE, IN THIS ORDER (comma-separated descriptors):
+  1. SUBJECT — a specific person, object, or creature with concrete attributes: \
+age, gender, expression, posture, clothing material and color, hands and what \
+they hold, what they are physically doing right now. Avoid pronouns and \
+generic nouns ("a man" → "a weathered Roman general in his fifties, deep \
+furrowed brow, bronze cuirass with embossed laurels, scarlet wool cloak \
+clasped at one shoulder, gripping a vellum scroll").
+  2. SETTING — a specific place with architectural / environmental detail: \
+era, materials, props, foreground and background elements, weather, time of \
+day. ("a candlelit Senate chamber, travertine columns, mosaic floor, late \
+afternoon sun slanting through high windows, dust motes suspended in the air").
+  3. LIGHTING — direction + quality + color temperature: "warm tungsten key \
+light from camera-left, deep shadows on the right, soft golden bounce from \
+the marble floor" or "cold overcast daylight through tall windows, soft \
+wraparound, faint blue rim from a snowy courtyard outside."
+  4. COMPOSITION — shot size + camera angle + framing: "medium close-up, \
+slight low angle, rule-of-thirds with subject on the right, soft bokeh \
+foreground" or "wide establishing shot, eye-level, symmetrical, leading \
+lines down the colonnade."
+  5. COLOR PALETTE — 2–3 dominant colors with adjectives: "muted ochre and \
+ivory with deep oxblood accents" or "desaturated steel-blue and slate-grey \
+with a single warm amber highlight."
+  6. ATMOSPHERE / TEXTURE — particulates, surfaces, micro-detail: "fine dust \
+motes catching the light, wax dripping down brass candle sticks, faint \
+woodsmoke in the air, pores and stubble visible on the subject's skin."
+  7. MOOD — one phrase: "solemn, weight of decision."
+
+CRITICAL RULES:
+- PHOTOGRAPHABLE ONLY — describe physical things a camera could capture. \
+NEVER describe text, slides, charts, logos, UI, captions, words on screen, \
+icons, infographics, abstract diagrams, or symbolic illustrations.
+- Stay grounded in the LITERAL spoken content of the beat. If the beat says \
+"the Roman Senate voted to extend the war," depict the Senate chamber and \
+its senators — not a generic city skyline, not text floating in space.
+- Each prompt must be DISTINCT from its neighbors. No two consecutive prompts \
+may share the same subject, location, lighting setup, camera angle, OR color \
+palette. Vary deliberately.
+- Be SPECIFIC, never generic. "A soldier" is wrong; "a young legionary, \
+sweat-streaked face, bronze helmet dented on one side, gripping a pilum" is \
+right.
+- Target 45–80 words per prompt. Pack detail; do not pad with filler.
+- Do NOT append style suffixes like "cinematic, 35mm film, photorealistic, \
+8k, dramatic lighting" — those are added automatically. Spend your tokens on \
+the SCENE, not on style boilerplate.
+
+EXAMPLE OUTPUT (for two beats about Roman politics):
+1. A grey-bearded Roman senator in his sixties, brow furrowed in concern, \
+ivory toga draped over his left shoulder, right hand resting on the pommel \
+of a ceremonial dagger at his belt, standing alone in a marble Senate \
+chamber, travertine columns receding into shadow, late afternoon sun \
+slanting through high clerestory windows, warm amber key light from \
+camera-right, deep umber shadows pooling on the mosaic floor, medium shot \
+at eye level slightly from the side, palette of warm ivory, oxblood, and \
+travertine cream, fine dust motes visible in the shafts of light, mood: \
+weight of an irrevocable decision.
+2. A young Roman messenger on horseback, leather lorica streaked with mud, \
+helmet hanging from the saddle, reins gripped in chapped hands, galloping \
+along a wet stone road cutting through a misted Italian valley at dawn, \
+cypress trees in silhouette on the ridges behind, low cold blue ambient \
+light, single warm shaft of rising sun breaking through cloud on the left, \
+wide tracking shot at low angle level with the horse's chest, palette of \
+slate blue, wet-stone grey, and saddle leather brown, dew on the grass and \
+mist clinging to the horse's flanks, mood: urgency under a still cold \
+sky."""
 
 
-def _seconds_per_visual_default() -> int:
-    """How long each director-generated still should sit on screen, in seconds."""
-    return 12
+_SENTENCE_END_RE = re.compile(r'[.!?]["\')\]]*\s*$')
+_NUM_PREFIX_RE = re.compile(r'^\s*(\d{1,3})\s*[.\)\]:]?\s+')
 
 
-def _segment_duration_seconds(seg: dict, fallback_wpm: int = 150) -> float:
-    """Best estimate of a segment's spoken duration, in seconds.
+def _load_whisper_words(output_dir: Path) -> list[dict]:
+    """Read whisper_words.json from the episode dir; return [] if missing."""
+    p = output_dir / "whisper_words.json"
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception as exc:
+        logger.info("Could not read whisper_words.json: %s", exc)
+        return []
 
-    Prefers the writer's `target_seconds`; falls back to actual_words/wpm.
+
+def _build_beats_from_whisper(
+    words: list[dict],
+    min_seconds: float = 9.0,
+    max_seconds: float = 16.0,
+) -> list[dict]:
+    """Group whisper words into ~12s beats, closing on sentence punctuation.
+
+    A beat closes when either:
+      (a) the running duration crosses min_seconds AND the last word ends in
+          sentence punctuation (. ! ?), or
+      (b) the running duration reaches max_seconds (forced close mid-sentence).
+
+    Returns list of {start_ms, end_ms, text}. The text is the literal joined
+    spoken transcript of the beat.
     """
-    ts = seg.get("target_seconds")
-    if isinstance(ts, (int, float)) and ts > 0:
-        return float(ts)
-    words = int(seg.get("actual_words") or 0)
     if not words:
-        from utils import strip_markers
-        words = len(strip_markers(seg.get("text") or "").split())
-    return (words / fallback_wpm) * 60 if words else 0.0
+        return []
+
+    beats: list[dict] = []
+    buf_start_ms: Optional[int] = None
+    buf_end_ms = 0
+    buf_words: list[str] = []
+
+    for w in words:
+        w_text = (w.get("word") or "").strip()
+        if not w_text:
+            continue
+        try:
+            w_start_ms = int(float(w.get("start") or 0.0) * 1000)
+            w_end_ms = int(float(w.get("end") or 0.0) * 1000)
+        except (TypeError, ValueError):
+            continue
+        if buf_start_ms is None:
+            buf_start_ms = w_start_ms
+        buf_words.append(w_text)
+        buf_end_ms = w_end_ms
+
+        elapsed = (buf_end_ms - buf_start_ms) / 1000.0
+        sentence_end = bool(_SENTENCE_END_RE.search(w_text))
+        if (elapsed >= min_seconds and sentence_end) or elapsed >= max_seconds:
+            beats.append({
+                "start_ms": buf_start_ms,
+                "end_ms": buf_end_ms,
+                "text": " ".join(buf_words),
+            })
+            buf_start_ms = None
+            buf_words = []
+
+    # Glue a tiny remainder onto the previous beat so we don't end with a
+    # 2-second flash, but only if there IS a previous beat to extend.
+    if buf_words and buf_start_ms is not None:
+        tail_ms = buf_end_ms - buf_start_ms
+        if beats and tail_ms < min_seconds * 1000:
+            beats[-1]["end_ms"] = buf_end_ms
+            beats[-1]["text"] = beats[-1]["text"] + " " + " ".join(buf_words)
+        else:
+            beats.append({
+                "start_ms": buf_start_ms,
+                "end_ms": buf_end_ms,
+                "text": " ".join(buf_words),
+            })
+    return beats
 
 
-def _llm_director_prompts_sync(
-    segments: list[dict],
-    seconds_per_visual: int = None,
-) -> list[list[str]] | None:
-    """For each segment, ask the LLM for a list of distinct cinematic prompts
-    proportional to the segment's spoken duration.
+def _carve_cue_ranges_from_beats(
+    beats: list[dict],
+    cues: list[dict],
+    *,
+    min_keep_ms: int = 2000,
+) -> list[dict]:
+    """Subtract every cue's [start_ms, end_ms] range from each beat.
 
-    Returns a parallel list `out` where `out[i]` is the prompt list for
-    `segments[i]`. Returns None if the LLM is unavailable so the caller can
-    fall back to the rule-based path.
+    Cues are authoritative — they keep their exact slot. A beat fully inside
+    a cue is dropped; a beat that straddles a cue boundary is trimmed (and
+    split, if the cue sits inside the beat). Trimmed pieces shorter than
+    min_keep_ms are discarded so we don't ship sub-2-second visual flashes.
     """
-    if seconds_per_visual is None:
-        seconds_per_visual = _seconds_per_visual_default()
+    if not cues:
+        return list(beats)
+
+    ranges = sorted((int(c["start_ms"]), int(c["end_ms"])) for c in cues if c.get("end_ms", 0) > c.get("start_ms", 0))
+    if not ranges:
+        return list(beats)
+
+    out: list[dict] = []
+    for beat in beats:
+        b_start = int(beat["start_ms"])
+        b_end = int(beat["end_ms"])
+        pieces: list[tuple[int, int]] = [(b_start, b_end)]
+        for r_start, r_end in ranges:
+            if r_end <= b_start or r_start >= b_end:
+                continue
+            new_pieces: list[tuple[int, int]] = []
+            for p_start, p_end in pieces:
+                if r_end <= p_start or r_start >= p_end:
+                    new_pieces.append((p_start, p_end))
+                    continue
+                if r_start > p_start:
+                    new_pieces.append((p_start, r_start))
+                if r_end < p_end:
+                    new_pieces.append((r_end, p_end))
+            pieces = new_pieces
+            if not pieces:
+                break
+
+        for p_start, p_end in pieces:
+            if p_end - p_start < min_keep_ms:
+                continue
+            out.append({
+                "start_ms": p_start,
+                "end_ms": p_end,
+                "text": beat.get("text", ""),
+            })
+    return out
+
+
+def _parse_numbered_prompts(raw: str, expected: int) -> list[str]:
+    """Parse 'N. <prompt>' lines into a parallel list. Missing slots are ''."""
+    out = [""] * expected
+    if not raw:
+        return out
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("```"):
+            continue
+        m = _NUM_PREFIX_RE.match(s)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if not 0 <= idx < expected:
+            continue
+        body = s[m.end():].strip()
+        # Strip a leading bracketed tag like "[Scene 1]" if the model added one.
+        body = re.sub(r"^\[[^\]]{1,20}\]\s*", "", body).rstrip(",.")
+        if len(body.split()) >= 3 and not body.lower().startswith(("here", "okay", "sure")):
+            out[idx] = body
+    return out
+
+
+def _rule_based_beat_prompt(text: str) -> str:
+    """LLM-free fallback prompt: phrase-seeded establishing shot."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    seed = " ".join(cleaned.split()[:14]).rstrip(".!?,;:")
+    if not seed:
+        return "ambient cinematic landscape, soft volumetric light, atmospheric mood"
+    return f"establishing shot inspired by: {seed}"
+
+
+def _llm_beat_prompts_sync(
+    beats: list[dict],
+    batch_size: int = 10,
+) -> Optional[list[str]]:
+    """Generate one cinematic prompt per beat via batched LLM calls.
+
+    Returns a list of prompts parallel to `beats`, or None if the LLM is
+    completely unavailable. Slots the LLM failed on are filled with the
+    rule-based fallback so the caller always gets a usable prompt per beat.
+    """
+    if not beats:
+        return []
     try:
         from llm_client import get_client
         client = get_client()
@@ -388,114 +713,154 @@ def _llm_director_prompts_sync(
     if client is None:
         return None
 
-    from utils import strip_markers
     import asyncio
 
-    out: list[list[str]] = []
-    for i, seg in enumerate(segments):
-        duration_s = _segment_duration_seconds(seg)
-        target_count = max(1, round(duration_s / seconds_per_visual)) if duration_s > 0 else 1
-        # Use the spoken text only — markers would confuse the visual director.
-        spoken = strip_markers(seg.get("text") or "").strip()
-        if not spoken:
-            out.append([])
-            continue
-
-        seg_name = seg.get("name") or f"Segment {i+1}"
-        sys_prompt = DIRECTOR_SYSTEM_PROMPT.format(target_count=target_count)
+    out: list[str] = [""] * len(beats)
+    for batch_start in range(0, len(beats), batch_size):
+        batch = beats[batch_start:batch_start + batch_size]
+        n = len(batch)
+        user_lines = [f"{i+1}. {b['text']}" for i, b in enumerate(batch)]
         user_prompt = (
-            f"Segment name: {seg_name}\n"
-            f"Approx duration: {duration_s:.0f}s.\n"
-            f"Generate exactly {target_count} chronological visual prompts "
-            f"for this segment.\n\n"
-            f"Segment text:\n\"\"\"\n{spoken}\n\"\"\""
+            f"Here are {n} consecutive audio beats from the podcast. Each line "
+            f"is the literal spoken text of that beat. Write exactly {n} "
+            f"extremely detailed cinematic prompts — one per beat, in order — "
+            f"following the SUBJECT / SETTING / LIGHTING / COMPOSITION / "
+            f"COLOR / ATMOSPHERE / MOOD structure from the system prompt. "
+            f"Each prompt must be 45–80 words. Do not skip any of the seven "
+            f"elements. Stay literal to the spoken text.\n\n"
+            f"BEATS:\n" + "\n".join(user_lines)
         )
+        batch_idx = batch_start // batch_size
         try:
-            # build_visual_bed runs on a worker thread (asyncio.to_thread),
-            # so a fresh asyncio.run is safe here.
             raw = asyncio.run(client.system_user(
-                sys_prompt,
+                BEAT_DIRECTOR_SYSTEM,
                 user_prompt,
-                temperature=0.7,
-                max_tokens=max(256, target_count * 80),
+                temperature=0.75,
+                # Generous budget: thinking models can spend 2-3 KB reasoning
+                # before they emit the numbered prompts. n*300 = ~3000 for
+                # a full batch of 10 detailed prompts, plus a 4 KB floor for
+                # the reasoning preamble.
+                max_tokens=max(8000, n * 300),
             ))
         except Exception as exc:
-            logger.warning("[Director] LLM call failed for '%s': %s", seg_name, exc)
-            out.append([])
+            logger.warning("[BeatDirector] batch %d LLM call failed: %s", batch_idx, exc)
             continue
 
-        prompts = _parse_director_lines(raw, target_count)
-        logger.info("[Director] '%s' -> %d prompt(s) for ~%ds", seg_name, len(prompts), int(duration_s))
-        out.append(prompts)
+        parsed = _parse_numbered_prompts(raw, n)
+        filled = sum(1 for p in parsed if p)
+        logger.info("[BeatDirector] batch %d -> %d/%d prompts parsed", batch_idx, filled, n)
+        for i, p in enumerate(parsed):
+            if p:
+                out[batch_start + i] = p
+
+    for i, p in enumerate(out):
+        if not p:
+            out[i] = _rule_based_beat_prompt(beats[i]["text"])
     return out
 
 
-def _parse_director_lines(raw: str, target_count: int) -> list[str]:
-    """Pull `target_count` clean prompt lines out of an LLM response."""
-    if not raw:
-        return []
-    lines: list[str] = []
-    for line in raw.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        # Drop common LLM noise: numbering, bullets, code fences, headings.
-        if s.startswith("```"):
-            continue
-        # Drop common LLM prefixes: "1. foo", "1) foo", "- foo", "* foo", "• foo"
-        s = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", s)
-        # Drop a leading bracketed prompt index like "[1]" or "[Scene 1]"
-        s = re.sub(r"^\[[^\]]{1,20}\]\s*", "", s)
-        # Skip preamble lines that don't look like prompts
-        if len(s.split()) < 3:
-            continue
-        if s.lower().startswith(("here are", "here is", "okay", "sure")):
-            continue
-        lines.append(s)
-        if len(lines) >= target_count:
-            break
+def _beat_cache_fingerprint(words: list[dict], cues: list[dict]) -> str:
+    """Fingerprint over whisper word timings + cue ranges.
 
-    # If the LLM gave us fewer lines than asked, accept what we got.
-    return lines
-
-
-def _rule_based_segment_prompts(
-    segments: list[dict],
-    seconds_per_visual: int = None,
-) -> list[list[str]]:
-    """LLM-free fallback: derive N prompts per segment by chunking its text.
-
-    For each segment we split it into roughly equal chunks and use each
-    chunk's first ~12 words as a prompt seed. Better than the old
-    one-prompt-fits-all derivation, but still nowhere near LLM quality.
+    Cue *prompts* are intentionally excluded — editing a cue's prompt via the
+    re-roll endpoint should not invalidate the beat director's prompt cache,
+    only the cue's own clip. Cue *ranges* are included because they determine
+    which beats get carved out.
     """
-    if seconds_per_visual is None:
-        seconds_per_visual = _seconds_per_visual_default()
-    from utils import strip_markers
-    out: list[list[str]] = []
-    for seg in segments:
-        duration_s = _segment_duration_seconds(seg)
-        target_count = max(1, round(duration_s / seconds_per_visual)) if duration_s > 0 else 1
-        spoken = strip_markers(seg.get("text") or "").strip()
-        words = spoken.split()
-        if not words:
-            out.append([])
-            continue
-        # Slice the word list into target_count near-equal chunks.
-        chunks: list[list[str]] = []
-        if target_count <= 1:
-            chunks = [words]
-        else:
-            step = max(1, len(words) // target_count)
-            for k in range(target_count):
-                chunks.append(words[k * step:(k + 1) * step] if k < target_count - 1 else words[k * step:])
-        prompts = []
-        for chunk in chunks:
-            seed = " ".join(chunk[:14]).rstrip(".!?,;:")
-            if seed:
-                prompts.append(f"establishing shot inspired by: {seed}")
-        out.append(prompts)
-    return out
+    import hashlib
+    h = hashlib.sha256()
+    h.update(f"v2|{len(words)}|".encode("ascii"))
+    for i, w in enumerate(words):
+        # Sample word text every 20 words to keep the digest cheap.
+        if i % 20 == 0:
+            h.update((w.get("word") or "").encode("utf-8"))
+        h.update(f"{float(w.get('start',0)):.2f}-{float(w.get('end',0)):.2f}|".encode("ascii"))
+    for c in cues:
+        h.update(f"|{int(c.get('start_ms',0))}-{int(c.get('end_ms',0))}".encode("ascii"))
+    return h.hexdigest()[:16]
+
+
+def _load_cached_beats(output_dir: Path) -> list[dict]:
+    """Read the on-disk beat cache without rebuilding.
+
+    Returned for app.py's cue-regen path so it can re-derive the same
+    interval ordering used by the original build without paying for a
+    second LLM pass. Returns [] if the cache is missing or malformed.
+    """
+    cache = output_dir / "visual_director.json"
+    if not cache.exists():
+        return []
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if data.get("version") != 3:
+        return []
+    return data.get("beats") or []
+
+
+def _load_or_build_beat_schedule(
+    output_dir: Path,
+    words: list[dict],
+    cues: list[dict],
+    audio_duration_ms: int,
+    progress: Optional[Callable[[str, int], None]] = None,
+) -> list[dict]:
+    """Build (or load from cache) the beat schedule for this episode.
+
+    Cache file:  outputs/<episode>/visual_director.json
+    Schema:      {"version": 3, "fingerprint": "...", "beats": [...]}
+    Each beat:   {start_ms, end_ms, text, prompt}.
+
+    Version bumps to force a clean rebuild whenever the system prompt or
+    output structure changes (so already-rendered episodes don't keep
+    serving prompts written under the old style).
+    """
+    if not words or audio_duration_ms <= 0:
+        return []
+
+    cache = output_dir / "visual_director.json"
+    fp = _beat_cache_fingerprint(words, cues)
+    if cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            if data.get("version") == 3 and data.get("fingerprint") == fp:
+                cached_beats = data.get("beats") or []
+                if cached_beats:
+                    logger.info("[BeatDirector] Loaded %d cached beat(s).", len(cached_beats))
+                    return cached_beats
+        except Exception as exc:
+            logger.info("[BeatDirector] Cache read failed (%s) — rebuilding.", exc)
+
+    if progress:
+        progress("Visual director: planning beats from audio...", 3)
+
+    beats = _build_beats_from_whisper(words)
+    beats = _carve_cue_ranges_from_beats(beats, cues)
+    if not beats:
+        logger.info("[BeatDirector] No beats survived cue carving — episode is fully cued.")
+        return []
+
+    if progress:
+        progress(f"Visual director: generating prompts for {len(beats)} beat(s)...", 4)
+    prompt_list = _llm_beat_prompts_sync(beats)
+    if prompt_list is None:
+        logger.info("[BeatDirector] LLM unavailable — using rule-based fallback.")
+        prompt_list = [_rule_based_beat_prompt(b["text"]) for b in beats]
+
+    for beat, prompt in zip(beats, prompt_list):
+        beat["prompt"] = prompt
+
+    try:
+        cache.write_text(
+            json.dumps({"version": 3, "fingerprint": fp, "beats": beats}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("[BeatDirector] Could not write cache: %s", exc)
+
+    logger.info("[BeatDirector] Built %d beat(s) with LLM prompts.", len(beats))
+    return beats
 
 
 # ---------------------------------------------------------------------------
@@ -517,291 +882,84 @@ def _audio_duration_ms(audio_path: Path) -> int:
     return 0
 
 
-def _script_fingerprint(script_segments: list[dict]) -> str:
-    """Stable hash of the spoken-text content of every segment.
-
-    Used to invalidate the director-prompt cache automatically when the
-    user edits a segment via /api/regenerate-segment.
-    """
-    import hashlib
-    from utils import strip_markers
-    h = hashlib.sha256()
-    for seg in script_segments:
-        text = strip_markers(seg.get("text") or "").strip()
-        h.update(seg.get("name", "").encode("utf-8") + b"|" + text.encode("utf-8") + b"||")
-    return h.hexdigest()[:16]
-
-
-def _load_or_build_director_schedule(
-    output_dir: Path,
-    script_segments: list[dict],
-    audio_duration_ms: int,
-    progress: Optional[Callable[[str, int], None]] = None,
-) -> list[tuple[int, int, str, int]] | None:
-    """Build (or load from cache) a director schedule for this episode.
-
-    Cache file: outputs/<episode>/visual_director.json
-    Schema:   {"fingerprint": "...", "schedule": [[start, end, prompt, seg_i], ...]}
-    """
-    if not script_segments or audio_duration_ms <= 0:
-        return None
-
-    cache = output_dir / "visual_director.json"
-    fp = _script_fingerprint(script_segments)
-    if cache.exists():
-        try:
-            data = json.loads(cache.read_text(encoding="utf-8"))
-            if data.get("fingerprint") == fp and data.get("schedule"):
-                schedule = [tuple(row) for row in data["schedule"]]
-                logger.info("[Director] Loaded %d cached prompt(s).", len(schedule))
-                return schedule
-        except Exception as exc:
-            logger.info("[Director] Cache read failed (%s) — rebuilding.", exc)
-
-    if progress:
-        progress("Visual director: generating prompts...", 3)
-
-    boundaries = _segment_audio_boundaries(script_segments, audio_duration_ms)
-    segment_prompts = _llm_director_prompts_sync(script_segments)
-    if segment_prompts is None or all(not lst for lst in segment_prompts):
-        # Fall back to rule-based per-segment chunking — better than the old
-        # one-prompt-fits-all derivation but no LLM creativity.
-        logger.info("[Director] LLM unavailable — using rule-based per-segment prompts.")
-        segment_prompts = _rule_based_segment_prompts(script_segments)
-
-    schedule = _build_director_schedule(segment_prompts, boundaries)
-    if not schedule:
-        return None
-
-    # Persist for re-rolls
-    try:
-        cache.write_text(
-            json.dumps({"fingerprint": fp, "schedule": schedule}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        logger.warning("[Director] Could not write cache: %s", exc)
-
-    logger.info("[Director] Built schedule with %d prompt(s) across %d segment(s).",
-                len(schedule), len(script_segments))
-    return schedule
-
-
-def _segment_audio_boundaries(
-    script_segments: list[dict],
-    audio_duration_ms: int,
-) -> list[tuple[int, int]]:
-    """Estimate (start_ms, end_ms) on the master audio for each script segment.
-
-    Distributes audio time proportionally to each segment's spoken duration
-    (preferring `target_seconds`, falling back to actual_words/wpm). Used by
-    the director to know which segment a given timestamp belongs to.
-    """
-    if not script_segments or audio_duration_ms <= 0:
-        return []
-    weights = [max(0.001, _segment_duration_seconds(s)) for s in script_segments]
-    total = sum(weights) or 1.0
-    boundaries: list[tuple[int, int]] = []
-    cursor = 0
-    for i, w in enumerate(weights):
-        if i == len(weights) - 1:
-            end = audio_duration_ms
-        else:
-            end = cursor + int((w / total) * audio_duration_ms)
-        boundaries.append((cursor, end))
-        cursor = end
-    return boundaries
-
-
-def _build_director_schedule(
-    segment_prompts: list[list[str]],
-    segment_boundaries: list[tuple[int, int]],
-) -> list[tuple[int, int, str, int]]:
-    """Turn per-segment prompt lists into a flat timeline schedule.
-
-    Returns (start_ms, end_ms, prompt, segment_index) tuples spanning the
-    full audio range, sorted by start_ms. Each prompt occupies an equal
-    sub-slice of its segment's audio range.
-    """
-    schedule: list[tuple[int, int, str, int]] = []
-    for i, prompts in enumerate(segment_prompts):
-        if not prompts or i >= len(segment_boundaries):
-            continue
-        seg_start, seg_end = segment_boundaries[i]
-        seg_dur = max(1, seg_end - seg_start)
-        n = len(prompts)
-        for j, prompt in enumerate(prompts):
-            sub_start = seg_start + (seg_dur * j) // n
-            sub_end = seg_start + (seg_dur * (j + 1)) // n
-            schedule.append((sub_start, sub_end, prompt, i))
-    schedule.sort(key=lambda t: t[0])
-    return schedule
-
-
 def _plan_intervals(
     visual_cues: list[dict],
     audio_duration_ms: int,
     script_segments: list[dict] | None = None,
-    max_interval_ms: int = 12_000,
-    director_schedule: list[tuple[int, int, str, int]] | None = None,
+    beat_schedule: list[dict] | None = None,
+    max_interval_ms: int = 16_000,
 ) -> list[dict]:
-    """Carve the audio timeline into a sequence of visual intervals.
+    """Merge cue intervals + beat intervals into a chronological interval list.
 
-    Each interval has:
-        kind  — 'cue' (had an explicit [VISUAL:] marker) or 'gap' (filler)
-        prompt — what to send to the image/video model
-        start_ms, end_ms — position on the master audio timeline
+    Each cue becomes an interval with kind='cue' (CogVideoX-eligible). Each
+    beat becomes an interval with kind='gap' (SDXL still + Ken-Burns). Beats
+    are already cue-carved by the caller, so there's no overlap to resolve.
 
-    When `director_schedule` is provided AND there are no `[VISUAL:]` cues,
-    the schedule's intervals are used directly — every gap gets a unique,
-    LLM-authored prompt instead of all sharing one fallback prompt.
-
-    Gaps longer than `max_interval_ms` are still split so no single still
-    drags on for the whole intro/outro.
+    When `beat_schedule` is empty (no Whisper word timings, LLM unavailable)
+    any audio range not covered by cues is filled with last-resort fallback
+    gap intervals derived from the script text — same legacy behavior the
+    pipeline had before the beat planner existed.
     """
     intervals: list[dict] = []
 
-    if not visual_cues:
-        # Director path: each schedule entry IS one interval, no sub-splitting.
-        # The LLM already sized prompts to ~12 s by issuing target_count =
-        # round(segment_seconds / 12); duplicating an image across sub-splits
-        # of the same interval would defeat the whole point of the director.
-        # Any interval >18 s still gets one extra split as a comfort cap so
-        # nothing sits totally static for ages.
-        if director_schedule:
-            soft_cap = max(max_interval_ms, 18_000)
-            for (start, end, prompt, _seg_i) in director_schedule:
-                if end - start <= soft_cap:
-                    intervals.append({
-                        "kind": "gap",
-                        "prompt": prompt,
-                        "start_ms": start,
-                        "end_ms": end,
-                    })
-                else:
-                    cur = start
-                    while cur < end:
-                        nxt = min(cur + soft_cap, end)
-                        intervals.append({
-                            "kind": "gap",
-                            "prompt": prompt,
-                            "start_ms": cur,
-                            "end_ms": nxt,
-                        })
-                        cur = nxt
-            if not intervals or intervals[-1]["end_ms"] < audio_duration_ms:
-                _emit_gap_intervals(
-                    intervals,
-                    start_ms=intervals[-1]["end_ms"] if intervals else 0,
-                    end_ms=audio_duration_ms,
-                    script_segments=script_segments or [],
-                    max_interval_ms=max_interval_ms,
-                )
-            return intervals
-
-        # No director, no cues — last-resort evenly-spaced gaps with the
-        # legacy single-prompt derivation. Worse but keeps the pipeline alive.
-        cursor = 0
-        gap_prompt = _derive_gap_prompt(script_segments or [], 0)
-        while cursor < audio_duration_ms:
-            end = min(cursor + max_interval_ms, audio_duration_ms)
-            intervals.append({
-                "kind": "gap",
-                "prompt": gap_prompt,
-                "start_ms": cursor,
-                "end_ms": end,
-            })
-            cursor = end
-        return intervals
-
-    # First: leading gap before the first cue (if any audio precedes it).
-    first = visual_cues[0]
-    if first["start_ms"] > 0:
-        _emit_gap_intervals(
-            intervals,
-            start_ms=0,
-            end_ms=first["start_ms"],
-            script_segments=script_segments or [],
-            max_interval_ms=max_interval_ms,
-            director_schedule=director_schedule,
-        )
-
-    # Walk through cues, emitting one cue interval per marker and gap
-    # intervals for any audio that sits between two adjacent cues.
-    for i, cue in enumerate(visual_cues):
+    for cue in (visual_cues or []):
         intervals.append({
             "kind": "cue",
             "prompt": cue["prompt"],
-            "start_ms": cue["start_ms"],
-            "end_ms": cue["end_ms"],
+            "start_ms": int(cue["start_ms"]),
+            "end_ms": int(cue["end_ms"]),
         })
 
-    # Trailing gap after the last cue, if the cue ended before the audio did.
-    last = visual_cues[-1]
-    if last["end_ms"] < audio_duration_ms:
-        _emit_gap_intervals(
-            intervals,
-            start_ms=last["end_ms"],
-            end_ms=audio_duration_ms,
-            script_segments=script_segments or [],
-            max_interval_ms=max_interval_ms,
-            director_schedule=director_schedule,
-        )
+    if beat_schedule:
+        for beat in beat_schedule:
+            prompt = beat.get("prompt") or _rule_based_beat_prompt(beat.get("text", ""))
+            intervals.append({
+                "kind": "gap",
+                "prompt": prompt,
+                "start_ms": int(beat["start_ms"]),
+                "end_ms": int(beat["end_ms"]),
+            })
 
-    # Sort defensively in case _emit_gap_intervals appended out of order.
     intervals.sort(key=lambda iv: iv["start_ms"])
-    return intervals
+
+    # Fill any uncovered audio (leading silence, trailing music tail, or the
+    # whole timeline if we got no beats and no cues) with fallback gaps so
+    # the bed always spans the full duration.
+    filled: list[dict] = []
+    cursor = 0
+    for iv in intervals:
+        if iv["start_ms"] > cursor:
+            _emit_fallback_gaps(filled, cursor, iv["start_ms"], script_segments or [], max_interval_ms)
+        filled.append(iv)
+        cursor = max(cursor, iv["end_ms"])
+    if cursor < audio_duration_ms:
+        _emit_fallback_gaps(filled, cursor, audio_duration_ms, script_segments or [], max_interval_ms)
+    return filled
 
 
-def _emit_gap_intervals(
+def _emit_fallback_gaps(
     intervals: list[dict],
-    *,
     start_ms: int,
     end_ms: int,
     script_segments: list[dict],
     max_interval_ms: int,
-    director_schedule: list[tuple[int, int, str, int]] | None = None,
 ) -> None:
-    """Split a [start_ms, end_ms] gap into one or more gap intervals.
+    """Cover [start_ms, end_ms] with generic gap intervals.
 
-    When `director_schedule` is provided, each sub-interval gets the prompt
-    from the schedule entry whose midpoint falls inside it (or the nearest
-    one). That gives every gap a unique LLM-authored prompt instead of all
-    sharing one fallback.
+    Last-resort path used when no beat schedule is available (no Whisper
+    word timings, LLM down). Each sub-gap gets a phrase-seeded prompt from
+    the script so the bed isn't a single static image for the gap.
     """
     cursor = start_ms
     while cursor < end_ms:
         nxt = min(cursor + max_interval_ms, end_ms)
-        prompt = _pick_director_prompt(director_schedule, cursor, nxt) if director_schedule else None
-        if not prompt:
-            prompt = _derive_gap_prompt(script_segments, cursor)
         intervals.append({
             "kind": "gap",
-            "prompt": prompt,
+            "prompt": _derive_gap_prompt(script_segments, cursor),
             "start_ms": cursor,
             "end_ms": nxt,
         })
         cursor = nxt
-
-
-def _pick_director_prompt(
-    schedule: list[tuple[int, int, str, int]],
-    start_ms: int,
-    end_ms: int,
-) -> str | None:
-    """Find the schedule entry whose midpoint is closest to this gap's midpoint."""
-    if not schedule:
-        return None
-    target = (start_ms + end_ms) // 2
-    best = None
-    best_dist = None
-    for s_start, s_end, prompt, _seg in schedule:
-        s_mid = (s_start + s_end) // 2
-        d = abs(s_mid - target)
-        if best_dist is None or d < best_dist:
-            best = prompt
-            best_dist = d
-    return best
 
 
 def _derive_gap_prompt(script_segments: list[dict], at_ms: int) -> str:
@@ -876,13 +1034,18 @@ def _ken_burns_clip(
     return True
 
 
-def _concat_with_crossfade(
+def _xfade_single_pass(
     clip_paths: list[Path],
     out_path: Path,
-    crossfade_ms: int = VISUAL_CROSSFADE_MS,
-    fps: int = VISUAL_KEN_BURNS_FPS,
+    crossfade_ms: int,
+    fps: int,
 ) -> bool:
-    """Concatenate per-interval clips with a short xfade between them."""
+    """One ffmpeg invocation: xfade-concat the given clips into out_path.
+
+    Caller must keep len(clip_paths) small enough that the resulting
+    command line stays under the OS limit (~32 KB on Windows). Use
+    `_concat_with_crossfade` for arbitrary-length inputs — it chunks.
+    """
     if not clip_paths:
         return False
     if len(clip_paths) == 1:
@@ -890,7 +1053,6 @@ def _concat_with_crossfade(
         return True
 
     xfade_s = crossfade_ms / 1000.0
-    # Probe durations
     durations: list[float] = []
     for p in clip_paths:
         try:
@@ -903,13 +1065,10 @@ def _concat_with_crossfade(
         except Exception:
             durations.append(0.0)
 
-    # Build inputs and a chained xfade filter graph.
     inputs: list[str] = []
     for p in clip_paths:
         inputs.extend(["-i", str(p)])
 
-    # Each xfade consumes the cumulative offset of all prior clips minus
-    # the per-step crossfade overlap so transitions actually overlap.
     label_prev = "[0:v]"
     filt_parts: list[str] = []
     cumulative = durations[0]
@@ -941,9 +1100,79 @@ def _concat_with_crossfade(
     return True
 
 
+# Chunk size for batched xfade. 25 inputs keeps the ffmpeg command line
+# well under Windows' ~32 KB CreateProcess limit even with long episode
+# paths, while staying large enough that a 60-min episode finishes in
+# 2 passes (chunks + final stitch). Picked empirically.
+_XFADE_CHUNK_SIZE = 25
+
+
+def _concat_with_crossfade(
+    clip_paths: list[Path],
+    out_path: Path,
+    crossfade_ms: int = VISUAL_CROSSFADE_MS,
+    fps: int = VISUAL_KEN_BURNS_FPS,
+    *,
+    _chunk_size: int = _XFADE_CHUNK_SIZE,
+) -> bool:
+    """Crossfade-concat clips into out_path, chunking to dodge cmdline limits.
+
+    For long episodes (hundreds of intervals) a single ffmpeg invocation
+    with `-i` per clip plus a chained xfade filter exceeds Windows'
+    CreateProcess argument-length cap (WinError 206). We stitch in
+    batches of `_chunk_size`, then xfade the batch outputs together —
+    visually identical because each chunk boundary becomes a normal
+    xfade transition between the last frames of chunk N and the first
+    frames of chunk N+1.
+    """
+    if not clip_paths:
+        return False
+    if len(clip_paths) == 1:
+        shutil.copy(str(clip_paths[0]), str(out_path))
+        return True
+    if len(clip_paths) <= _chunk_size:
+        return _xfade_single_pass(clip_paths, out_path, crossfade_ms, fps)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out_path.parent / "_xfade_chunks"
+    tmp_dir.mkdir(exist_ok=True)
+    batch_outputs: list[Path] = []
+    try:
+        for batch_idx, start in enumerate(range(0, len(clip_paths), _chunk_size)):
+            batch = clip_paths[start:start + _chunk_size]
+            batch_out = tmp_dir / f"chunk_{batch_idx:03d}.mp4"
+            if len(batch) == 1:
+                shutil.copy(str(batch[0]), str(batch_out))
+            elif not _xfade_single_pass(batch, batch_out, crossfade_ms, fps):
+                logger.warning("Batch xfade failed at chunk %d", batch_idx)
+                return False
+            batch_outputs.append(batch_out)
+
+        # Recurse if the batch count itself is still too large (very long episodes).
+        if len(batch_outputs) > _chunk_size:
+            return _concat_with_crossfade(
+                batch_outputs, out_path, crossfade_ms, fps, _chunk_size=_chunk_size,
+            )
+        return _xfade_single_pass(batch_outputs, out_path, crossfade_ms, fps)
+    finally:
+        for p in batch_outputs:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+import threading as _threading
+_BUILD_LOCK = _threading.Lock()
+
 
 def build_visual_bed(
     audio_path: Path,
@@ -951,15 +1180,45 @@ def build_visual_bed(
     visual_cues: list[dict] | None = None,
     script_segments: list[dict] | None = None,
     progress: Optional[Callable[[str, int], None]] = None,
+    use_cogvideox: bool = False,
 ) -> Optional[Path]:
     """Build _visual_bed.mp4 spanning the full audio duration.
 
-    Phase 2 implementation: every interval gets an SDXL still + Ken-Burns
-    motion. Phase 3 will swap cue intervals for CogVideoX clips.
+    `use_cogvideox`: when True, cue intervals get overwritten with
+    CogVideoX-5B text-to-video clips (~10-15 min per cue on a 5060 Ti).
+    When False (the slideshow default), the bed is SDXL stills only +
+    Ken-Burns motion — orders of magnitude faster; a 30-minute episode
+    finishes in minutes instead of hours.
 
-    Returns the path to the rendered bed, or None on failure (caller should
-    fall back to the static-PNG flow in video_agent).
+    Serialized by a process-wide lock: if a second caller arrives while
+    one bed is being built (frontend auto-fire racing a manual click, or
+    duplicate /api/generate-video posts), it blocks until the first
+    finishes. Two parallel SDXL/CogVideoX pipelines won't fit in 16 GB
+    VRAM anyway, and racing on shared backend singletons caused the
+    "Cannot copy out of meta tensor" failure observed in the wild.
     """
+    if not _BUILD_LOCK.acquire(blocking=False):
+        logger.info(
+            "build_visual_bed: another build is in progress — waiting for it."
+        )
+        _BUILD_LOCK.acquire()
+    try:
+        return _build_visual_bed_impl(
+            audio_path, output_dir, visual_cues, script_segments, progress,
+            use_cogvideox=use_cogvideox,
+        )
+    finally:
+        _BUILD_LOCK.release()
+
+
+def _build_visual_bed_impl(
+    audio_path: Path,
+    output_dir: Path,
+    visual_cues: list[dict] | None,
+    script_segments: list[dict] | None,
+    progress: Optional[Callable[[str, int], None]],
+    use_cogvideox: bool = False,
+) -> Optional[Path]:
     if not _ffmpeg_ok():
         logger.warning("ffmpeg not in PATH — cannot build visual bed.")
         return None
@@ -987,29 +1246,46 @@ def build_visual_bed(
         logger.warning("Could not determine audio duration — aborting visual bed.")
         return None
 
-    # ── Visual director: ask the LLM for one detailed prompt every ~12 s ──
-    # Cached on disk so re-rolls and re-stitches don't re-LLM. The cache key
-    # is the script-segment text fingerprint, so editing the script
-    # invalidates it automatically.
-    director_schedule = _load_or_build_director_schedule(
-        output_dir, script_segments or [], duration_ms,
-        progress=progress,
+    # ── Beat director: ground every gap visual in what's actually being said ──
+    # Group Whisper words into ~12 s sentence-aligned beats, then ask the LLM
+    # for one cinematic prompt per beat. Beat ms-bounds come straight from
+    # Whisper so visuals fire exactly when the words are spoken. Cached to
+    # visual_director.json (v2 schema) keyed by whisper-words + cue-range
+    # fingerprint, so script-text edits and cue-prompt edits don't
+    # invalidate the cache unnecessarily.
+    words = _load_whisper_words(output_dir)
+    if not words:
+        logger.info(
+            "No whisper_words.json — beat director disabled, falling back to "
+            "phrase-seeded gap prompts. Re-run post-production to enable."
+        )
+    beat_schedule = _load_or_build_beat_schedule(
+        output_dir, words, visual_cues, duration_ms, progress=progress,
     )
+
+    # The director was the last LLM consumer for this episode (script editing
+    # via /api/regenerate-segment is a separate request). Free LM Studio's
+    # weights now so SDXL + (optionally) CogVideoX get the full 16 GB.
+    try:
+        from llm_client import unload_model
+        unload_model()
+    except Exception as exc:
+        logger.info("LLM unload before SDXL skipped: %s", exc)
 
     intervals = _plan_intervals(
         visual_cues,
         duration_ms,
-        script_segments or [],
-        director_schedule=director_schedule,
+        script_segments=script_segments or [],
+        beat_schedule=beat_schedule,
     )
     if not intervals:
         return None
     logger.info(
-        "Planned %d visual interval(s) across %.1fs of audio (%d cue, %d gap, director=%s).",
+        "Planned %d visual interval(s) across %.1fs of audio (%d cue, %d beat, beats=%s).",
         len(intervals), duration_ms / 1000,
         sum(1 for iv in intervals if iv["kind"] == "cue"),
         sum(1 for iv in intervals if iv["kind"] == "gap"),
-        "on" if director_schedule else "off",
+        "on" if beat_schedule else "off",
     )
 
     images_dir = output_dir / "_visual_images"
@@ -1057,9 +1333,14 @@ def build_visual_bed(
     finally:
         _SDXLBackend.unload()
 
-    # ── Pass 2: CogVideoX overwrites cue intervals (when available). ──────────
+    # ── Pass 2: CogVideoX overwrites cue intervals (when enabled + available). ──
     cue_indices = [i for i, iv in enumerate(intervals) if iv["kind"] == "cue"]
-    if cue_indices and _CogVideoXBackend.load():
+    if cue_indices and not use_cogvideox:
+        logger.info(
+            "Slideshow mode: skipping CogVideoX for %d cue interval(s) "
+            "(SDXL stills + Ken-Burns only).", len(cue_indices),
+        )
+    if cue_indices and use_cogvideox and _CogVideoXBackend.load():
         try:
             for n, i in enumerate(cue_indices):
                 iv = intervals[i]
@@ -1094,10 +1375,10 @@ def build_visual_bed(
                     logger.info("Stretch failed for interval %d — keeping SDXL still.", i)
         finally:
             _CogVideoXBackend.unload()
-    elif cue_indices:
+    elif cue_indices and use_cogvideox:
         logger.info(
-            "Skipping CogVideoX pass — falling back to SDXL stills for %d cue interval(s).",
-            len(cue_indices),
+            "CogVideoX requested but unavailable — falling back to SDXL stills "
+            "for %d cue interval(s).", len(cue_indices),
         )
 
     # Drop any None slots (intervals where everything failed) so concat works.
