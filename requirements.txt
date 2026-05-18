@@ -1,3 +1,8 @@
+# Loose top-level deps for the Docker image (python:3.10-slim, CPU torch).
+# For an EXACT reproduction of the development env (Blackwell GPU, SDXL +
+# CogVideoX video bed, Chatterbox prosody), use requirements.lock.txt and
+# follow SETUP.md — there is an FLAX_WEIGHTS_NAME patch and an ffmpeg
+# libass swap that `pip install` alone cannot perform.
 openai>=1.30.0
 ddgs>=6.0.0
 pydub>=0.25.1
